@@ -6,7 +6,7 @@ from typing import Optional
 class Config:
     # --- Image / patch ---
     image_size: int = 224
-    patch_size: int = 32
+    patch_size: int = 64         # 64px = ~29% of image width, enough to see structure
     in_channels: int = 3
 
     # --- Model dimensions ---
@@ -15,33 +15,37 @@ class Config:
     d_loc: int = 128        # LocTracker hidden / output dim
     num_loops: int = 16
     num_classes: int = 100
-    move_scale: float = 0.5  # max delta magnitude in normalized coords (tanh * this)
+    move_scale: float = 0.15 # max delta per step (~17px); takes ~5 steps to cross image
 
     # --- Loss ---
-    loc_loss_weight: float = 0.1  # weight of auxiliary location loss
+    loc_loss_weight: float = 0.1        # auxiliary location supervision
+    coverage_loss_weight: float = 0.05  # penalises low position variance across steps
+
+    # --- Movement ---
+    random_start: bool = True  # randomise pos_0 during training to break corner shortcuts
 
     # --- Training ---
     batch_size: int = 2048
-    num_epochs: int = 180
-    lr: float = 1e-3
+    num_epochs: int = 90
+    lr: float = 34e-3
     weight_decay: float = 0.05
     grad_clip: float = 1.0
-    warmup_epochs: int = 10
+    warmup_epochs: int = 5
     num_workers: int = 8
 
     # --- Data ---
     dataset_name: str = "clane9/imagenet-100"
-    dataset_cache_dir: str = "./data"         # HuggingFace arrow cache
-    jpeg_cache_dir: str = "./jpeg_cache"    # JPEGs on disk for DALI to read
+    dataset_cache_dir: str = "./data"
+    jpeg_cache_dir: str = "./jpeg_cache"
 
     # --- Checkpointing ---
     checkpoint_dir: str = "./checkpoints"
-    resume: Optional[str] = None  # path to checkpoint to resume from
+    resume: Optional[str] = None
 
     # --- Logging ---
     wandb_project: str = "saccade-net"
     wandb_entity: Optional[str] = None
-    log_interval: int = 50  # steps between wandb logs
+    log_interval: int = 50
 
     # --- Misc ---
     seed: int = 42

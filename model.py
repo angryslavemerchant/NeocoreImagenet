@@ -221,7 +221,15 @@ class SaccadeNet(nn.Module):
         device = x.device
 
         # Initialize state
-        pos = torch.zeros(B, 2, device=device)             # image center
+        # Random start during training breaks the "slam to corner and stay" degenerate
+        # solution by ensuring MoveNet can't learn a fixed absolute policy.
+        if self.cfg.random_start and self.training:
+            pixel_size = 2.0 / (self.cfg.image_size - 1)
+            half_patch  = (self.cfg.patch_size - 1) / 2.0 * pixel_size
+            lo, hi = -1.0 + half_patch, 1.0 - half_patch
+            pos = torch.zeros(B, 2, device=device).uniform_(lo, hi)
+        else:
+            pos = torch.zeros(B, 2, device=device)  # center at val time
         vec = torch.zeros(B, self.cfg.d_vec, device=device)
         h   = torch.zeros(1, B, self.cfg.d_loc, device=device)
         pos_0 = pos.clone()

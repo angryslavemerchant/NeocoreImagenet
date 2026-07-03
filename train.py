@@ -58,8 +58,16 @@ def compute_loss(
         aux_loss = aux_loss + F.mse_loss(aux_pred, true_disp)
     aux_loss = aux_loss / len(aux_preds)
 
-    total = task_loss + cfg.loc_loss_weight * aux_loss
-    return total, task_loss, aux_loss
+    # Coverage loss: penalise low variance in patch positions across steps.
+    # If the model camps in one spot, var -> 0 and this term is maximally penalised.
+    # Detach positions so this only pushes MoveNet, not the CNN or OutputNet.
+    positions = torch.stack([p.detach() for p in pos_history], dim=1)  # (B, T, 2)
+    coverage_loss = -positions.var(dim=1).mean()
+
+    total = (task_loss
+             + cfg.loc_loss_weight * aux_loss
+             + cfg.coverage_loss_weight * coverage_loss)
+    return total, task_loss, aux_loss, coverage_loss
 
 
 # ---------------------------------------------------------------------------
@@ -105,11 +113,11 @@ def train_one_epoch(
 ) -> tuple[float, float, float, int]:
     model.train()
 
-    losses      = AverageMeter()
-    task_losses = AverageMeter()
-    aux_losses  = AverageMeter()
-    top1        = AverageMeter()
-    top5        = AverageMeter()
+    losses          = AverageMeter()
+    task_losses     = AverageMeter()
+    aux_losses      = AverageMeter()
+    top1            = AverageMeter()
+    top5            = AverageMeter()
 
     pbar = tqdm(loader, desc=f"Epoch {epoch+1}/{cfg.num_epochs} [train]", leave=False)
 
@@ -121,7 +129,7 @@ def train_one_epoch(
         # Forward in bfloat16
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             logits, aux_preds, pos_history, pos_0 = model(images)
-            loss, task_loss, aux_loss = compute_loss(
+            loss, task_loss, aux_loss, coverage_loss = compute_loss(
                 logits, labels, aux_preds, pos_history, pos_0, cfg
             )
 
@@ -143,12 +151,13 @@ def train_one_epoch(
 
         if global_step % cfg.log_interval == 0:
             wandb.log({
-                "train/loss":        losses.avg,
-                "train/task_loss":   task_losses.avg,
-                "train/aux_loss":    aux_losses.avg,
-                "train/top1":        top1.avg,
-                "train/top5":        top5.avg,
-                "train/grad_scale":  scaler.get_scale(),
+                "train/loss":          losses.avg,
+                "train/task_loss":     task_losses.avg,
+                "train/aux_loss":      aux_losses.avg,
+                "train/coverage_loss": coverage_loss.item(),
+                "train/top1":          top1.avg,
+                "train/top5":          top5.avg,
+                "train/grad_scale":    scaler.get_scale(),
             }, step=global_step)
 
         global_step += 1
@@ -180,7 +189,7 @@ def validate(
 
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             logits, aux_preds, pos_history, pos_0 = model(images)
-            loss, _, _ = compute_loss(logits, labels, aux_preds, pos_history, pos_0, cfg)
+            loss, _, _, _ = compute_loss(logits, labels, aux_preds, pos_history, pos_0, cfg)
 
         acc1, acc5 = accuracy(logits.float(), labels, topk=(1, 5))
         losses.update(loss.item(), B)
@@ -218,9 +227,6 @@ def main():
 
     # Model
     model = SaccadeNet(cfg).to(device)
-
-    torch.compile(model)
-
     param_counts = model.count_parameters()
     print("\nParameter counts:")
     for name, count in param_counts.items():

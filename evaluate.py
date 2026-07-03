@@ -126,6 +126,20 @@ def evaluate(
     if visualize_n > 0:
         os.makedirs(traj_dir, exist_ok=True)
 
+    # Print one batch of raw trajectory coordinates before the main loop.
+    # Lets us distinguish "model is genuinely stuck" from "visualization bug".
+    print("\n--- Trajectory debug (first batch, first 3 images) ---")
+    _debug_images, _ = next(iter(val_loader))
+    _debug_images = _debug_images.to(device)
+    with torch.no_grad():
+        _, _, _pos_history, _pos_0 = model(_debug_images)
+    for img_idx in range(min(3, _debug_images.size(0))):
+        print(f"  image {img_idx}  start: [{_pos_0[img_idx][0].item():.3f}, {_pos_0[img_idx][1].item():.3f}]")
+        for t, pos in enumerate(_pos_history):
+            x, y = pos[img_idx][0].item(), pos[img_idx][1].item()
+            print(f"    step {t:02d}: [{x:.3f}, {y:.3f}]")
+    print("--- end debug ---\n")
+
     for images, labels in tqdm(val_loader, desc="Evaluating"):
         images = images.to(device)
         labels = labels.to(device)
