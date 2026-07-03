@@ -78,7 +78,7 @@ def load_checkpoint(
     scaler: GradScaler,
     device,
 ):
-    ckpt = torch.load(path, map_location=device)
+    ckpt = torch.load(path, map_location=device, weights_only=False)
     model.load_state_dict(ckpt["model"])
     optimizer.load_state_dict(ckpt["optimizer"])
     if "scaler" in ckpt:
@@ -218,7 +218,9 @@ def main():
 
     # Model
     model = SaccadeNet(cfg).to(device)
+
     torch.compile(model)
+
     param_counts = model.count_parameters()
     print("\nParameter counts:")
     for name, count in param_counts.items():

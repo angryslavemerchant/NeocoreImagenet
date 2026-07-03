@@ -109,7 +109,7 @@ def evaluate(
     device = torch.device(cfg.device if torch.cuda.is_available() else "cpu")
 
     model = SaccadeNet(cfg).to(device)
-    ckpt = torch.load(checkpoint_path, map_location=device)
+    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     model.load_state_dict(ckpt["model"])
     model.eval()
     print(f"Loaded checkpoint — epoch {ckpt['epoch']+1}, "
