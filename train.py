@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import wandb
+from torch.cuda.amp import GradScaler
 from tqdm import tqdm
 
 from config import Config
@@ -68,12 +69,20 @@ def compute_loss(
 def save_checkpoint(state: dict, path: str):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     torch.save(state, path)
-    
 
-def load_checkpoint(path: str, model: nn.Module, optimizer: torch.optim.Optimizer, device):
+
+def load_checkpoint(
+    path: str,
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scaler: GradScaler,
+    device,
+):
     ckpt = torch.load(path, map_location=device)
     model.load_state_dict(ckpt["model"])
     optimizer.load_state_dict(ckpt["optimizer"])
+    if "scaler" in ckpt:
+        scaler.load_state_dict(ckpt["scaler"])
     start_epoch = ckpt["epoch"] + 1
     best_top1   = ckpt.get("best_top1", 0.0)
     print(f"Resumed from epoch {start_epoch} (best top-1 so far: {best_top1:.2f}%)")
@@ -88,6 +97,7 @@ def train_one_epoch(
     model: nn.Module,
     loader,
     optimizer: torch.optim.Optimizer,
+    scaler: GradScaler,
     cfg: Config,
     epoch: int,
     device: torch.device,
@@ -108,17 +118,21 @@ def train_one_epoch(
         labels = labels.to(device, non_blocking=True)
         B = images.size(0)
 
-        logits, aux_preds, pos_history, pos_0 = model(images)
-        loss, task_loss, aux_loss = compute_loss(
-            logits, labels, aux_preds, pos_history, pos_0, cfg
-        )
+        # Forward in bfloat16
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            logits, aux_preds, pos_history, pos_0 = model(images)
+            loss, task_loss, aux_loss = compute_loss(
+                logits, labels, aux_preds, pos_history, pos_0, cfg
+            )
 
         optimizer.zero_grad()
-        loss.backward()
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
         nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
-        optimizer.step()
+        scaler.step(optimizer)
+        scaler.update()
 
-        acc1, acc5 = accuracy(logits, labels, topk=(1, 5))
+        acc1, acc5 = accuracy(logits.float(), labels, topk=(1, 5))
         losses.update(loss.item(), B)
         task_losses.update(task_loss.item(), B)
         aux_losses.update(aux_loss.item(), B)
@@ -129,11 +143,12 @@ def train_one_epoch(
 
         if global_step % cfg.log_interval == 0:
             wandb.log({
-                "train/loss":      losses.avg,
-                "train/task_loss": task_losses.avg,
-                "train/aux_loss":  aux_losses.avg,
-                "train/top1":      top1.avg,
-                "train/top5":      top5.avg,
+                "train/loss":        losses.avg,
+                "train/task_loss":   task_losses.avg,
+                "train/aux_loss":    aux_losses.avg,
+                "train/top1":        top1.avg,
+                "train/top5":        top5.avg,
+                "train/grad_scale":  scaler.get_scale(),
             }, step=global_step)
 
         global_step += 1
@@ -163,10 +178,11 @@ def validate(
         labels = labels.to(device, non_blocking=True)
         B = images.size(0)
 
-        logits, aux_preds, pos_history, pos_0 = model(images)
-        loss, _, _ = compute_loss(logits, labels, aux_preds, pos_history, pos_0, cfg)
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            logits, aux_preds, pos_history, pos_0 = model(images)
+            loss, _, _ = compute_loss(logits, labels, aux_preds, pos_history, pos_0, cfg)
 
-        acc1, acc5 = accuracy(logits, labels, topk=(1, 5))
+        acc1, acc5 = accuracy(logits.float(), labels, topk=(1, 5))
         losses.update(loss.item(), B)
         top1.update(acc1, B)
         top5.update(acc5, B)
@@ -232,16 +248,23 @@ def main():
         milestones=[cfg.warmup_epochs],
     )
 
+    # Mixed precision scaler
+    # bfloat16 has float32-range exponents so loss scaling rarely triggers,
+    # but keeping the scaler is harmless and handles edge cases gracefully.
+    scaler = GradScaler()
+
     # Resume
     start_epoch = 0
     best_top1   = 0.0
     global_step = 0
 
     if cfg.resume:
-        start_epoch, best_top1 = load_checkpoint(cfg.resume, model, optimizer, device)
+        start_epoch, best_top1 = load_checkpoint(
+            cfg.resume, model, optimizer, scaler, device
+        )
 
-    print(f"\nTraining on {device}")
-    print(f"Epochs: {cfg.num_epochs}  |  Batch size: {cfg.batch_size}  |  LR: {cfg.lr}\n")
+    print(f"\nTraining on {device} with bfloat16 autocast")
+    print(f"Epochs: {cfg.num_epochs}  |  Batch: {cfg.batch_size}  |  LR: {cfg.lr}\n")
 
     # Training loop
     for epoch in range(start_epoch, cfg.num_epochs):
@@ -249,7 +272,7 @@ def main():
         wandb.log({"train/lr": current_lr}, step=global_step)
 
         train_loss, train_top1, train_top5, global_step = train_one_epoch(
-            model, train_loader, optimizer, cfg, epoch, device, global_step
+            model, train_loader, optimizer, scaler, cfg, epoch, device, global_step
         )
         val_loss, val_top1, val_top5 = validate(
             model, val_loader, cfg, epoch, device, global_step
@@ -267,6 +290,7 @@ def main():
             "epoch":     epoch,
             "model":     model.state_dict(),
             "optimizer": optimizer.state_dict(),
+            "scaler":    scaler.state_dict(),
             "val_top1":  val_top1,
             "best_top1": best_top1,
             "cfg":       cfg,
