@@ -6,3 +6,8 @@ tqdm>=4.65.0
 wandb>=0.15.0
 matplotlib>=3.7.0
 numpy>=1.24.0
+# DALI — pick the right CUDA build for your system
+# CUDA 12.x (Blackwell):
+nvidia-dali-cuda120
+# CUDA 11.x:
+# nvidia-dali-cuda110

@@ -22,17 +22,17 @@ class Config:
 
     # --- Training ---
     batch_size: int = 2048
-    num_epochs: int = 90
+    num_epochs: int = 180
     lr: float = 1e-3
     weight_decay: float = 0.05
-    grad_clip: float = 0.5
+    grad_clip: float = 1.0
     warmup_epochs: int = 10
     num_workers: int = 8
 
     # --- Data ---
     dataset_name: str = "clane9/imagenet-100"
     dataset_cache_dir: str = "./data"         # HuggingFace arrow cache
-    tensor_cache_dir: str = "./tensor_cache"  # pre-decoded uint8 tensor cache
+    jpeg_cache_dir: str = "./jpeg_cache"    # JPEGs on disk for DALI to read
 
     # --- Checkpointing ---
     checkpoint_dir: str = "./checkpoints"
