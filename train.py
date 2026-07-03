@@ -218,6 +218,7 @@ def main():
 
     # Model
     model = SaccadeNet(cfg).to(device)
+    torch.compile(model)
     param_counts = model.count_parameters()
     print("\nParameter counts:")
     for name, count in param_counts.items():
