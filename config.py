@@ -27,9 +27,9 @@ class Config:
     random_start: bool = True
 
     # --- Training ---
-    batch_size: int = 256
+    batch_size: int = 256*4
     num_epochs: int = 90
-    lr: float = 8e-3
+    lr: float = 4e-3
     weight_decay: float = 0.05
     grad_clip: float = 1.0
     warmup_epochs: int = 10
