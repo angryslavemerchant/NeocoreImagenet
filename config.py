@@ -13,7 +13,7 @@ class Config:
     d_feat: int = 384       # CNN output / feature dim
     d_vec: int = 384        # accumulated output vector dim
     d_loc: int = 128        # LocTracker hidden / output dim
-    num_loops: int = 16
+    num_loops: int = 8
     num_classes: int = 100
     move_scale: float = 0.15 # max delta per step (~17px); takes ~5 steps to cross image
 
