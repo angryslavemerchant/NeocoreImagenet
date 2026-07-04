@@ -15,7 +15,7 @@ class Config:
     d_loc: int = 128        # LocTracker hidden / output dim
     num_loops: int = 8
     num_classes: int = 100
-    move_scale: float = 0.15 # max delta per step (~17px); takes ~5 steps to cross image
+    move_scale: float = 0.5# max delta per step (~17px); takes ~5 steps to cross image
 
     # --- Loss ---
     loc_loss_weight: float = 0.001        # auxiliary location supervision
