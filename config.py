@@ -25,7 +25,7 @@ class Config:
     random_start: bool = True  # randomise pos_0 during training to break corner shortcuts
 
     # --- Training ---
-    batch_size: int = 2048
+    batch_size: int = 1024
     num_epochs: int = 90
     lr: float = 34e-3
     weight_decay: float = 0.05
