@@ -19,7 +19,7 @@ class Config:
 
     # --- Loss ---
     loc_loss_weight: float = 0.001        # auxiliary location supervision
-    coverage_loss_weight: float = 0.05  # penalises low position variance across steps
+    coverage_loss_weight: float = 0.05   # penalises low position variance across steps
 
     # --- Movement ---
     random_start: bool = True  # randomise pos_0 during training to break corner shortcuts
