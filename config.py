@@ -18,7 +18,7 @@ class Config:
     move_scale: float = 0.15
 
     # --- Loss ---
-    loc_loss_weight: float = 0.1
+    loc_loss_weight: float = 0.000001
     coverage_loss_weight: float = 0.05
     min_step: float = 0.05  # hinge threshold — steps smaller than this are penalized
                             # 0.05 in normalized coords ≈ 5px on a 224px image
@@ -27,7 +27,7 @@ class Config:
     random_start: bool = True
 
     # --- Training ---
-    batch_size: int = 4096
+    batch_size: int = 4096*2
     num_epochs: int = 90
     lr: float = 8e-3
     weight_decay: float = 0.05
