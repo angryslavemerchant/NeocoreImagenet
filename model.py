@@ -18,8 +18,8 @@ class MobileNetBackbone(nn.Module):
     torch.no_grad() on the forward pass avoids storing activations for
     backward, which saves significant memory across 16 loop steps.
 
-    Only the projection layer (1280 -> d_feat) is trained, giving MoveNet
-    and OutputNet a learned adapter onto the pretrained feature space.
+    Only the projection layer (1280 -> d_feat) is trained, giving
+    OutputNet a learned adapter onto the pretrained feature space.
 
     Input:  (B, C, patch_size, patch_size)  — works fine for 64px patches
     Output: (B, d_feat)
@@ -43,36 +43,8 @@ class MobileNetBackbone(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Subnetworks  (unchanged from original)
+# Subnetworks
 # ---------------------------------------------------------------------------
-
-class MoveNet(nn.Module):
-    """
-    Predicts where to look next given current features and accumulated context.
-
-    Input:  f_t (B, d_feat) concat vec_t (B, d_vec) -> (B, d_feat + d_vec)
-    Output: delta (B, 2) — movement in normalized image coords, tanh-bounded
-
-    The tanh ensures the delta is bounded; move_scale controls max step size.
-    """
-
-    def __init__(self, cfg: Config):
-        super().__init__()
-        in_dim = cfg.d_feat + cfg.d_vec
-        hidden = 512
-        self.net = nn.Sequential(
-            nn.Linear(in_dim, hidden),
-            nn.GELU(),
-            nn.Linear(hidden, hidden),
-            nn.GELU(),
-            nn.Linear(hidden, 2),
-        )
-        self.move_scale = cfg.move_scale
-
-    def forward(self, f_t: torch.Tensor, vec_t: torch.Tensor) -> torch.Tensor:
-        x = torch.cat([f_t, vec_t], dim=-1)
-        return torch.tanh(self.net(x)) * self.move_scale  # (B, 2)
-
 
 class LocTracker(nn.Module):
     """
@@ -116,27 +88,46 @@ class AuxLocHead(nn.Module):
 
 class OutputNet(nn.Module):
     """
-    Combines patch features with spatial context to produce each step's
-    contribution to the accumulated output vector.
+    Unified network: given patch features and spatial context, produces
+    both the content contribution AND the movement decision.
 
-    Input:  f_t (B, d_feat) concat loc_t (B, d_loc)
-    Output: v_t (B, d_vec)
+    Replaces the separate MoveNet + OutputNet pair. A shared trunk
+    extracts a joint semantic representation; two lightweight heads
+    branch from it — one for content accumulation, one for navigation.
+
+    The key insight: where to look next IS a function of what you just
+    understood. A separate MoveNet reading a classification-optimized vec
+    creates a goal mismatch. Here the same representation drives both.
+
+    Input:  f_t   (B, d_feat)  — patch features (frozen backbone)
+            loc   (B, d_loc)   — spatial context from PREVIOUS step
+                                 (zeros at step 0)
+    Output: v_t   (B, d_vec)   — content contribution, added to vec
+            delta (B, 2)       — movement, tanh-bounded by move_scale
     """
 
     def __init__(self, cfg: Config):
         super().__init__()
         in_dim = cfg.d_feat + cfg.d_loc
         hidden = 512
-        self.net = nn.Sequential(
+        self.move_scale = cfg.move_scale
+
+        self.trunk = nn.Sequential(
             nn.Linear(in_dim, hidden),
             nn.GELU(),
             nn.Linear(hidden, hidden),
             nn.GELU(),
-            nn.Linear(hidden, cfg.d_vec),
         )
+        self.content_head = nn.Linear(hidden, cfg.d_vec)
+        self.move_head    = nn.Linear(hidden, 2)
 
-    def forward(self, f_t: torch.Tensor, loc_t: torch.Tensor) -> torch.Tensor:
-        return self.net(torch.cat([f_t, loc_t], dim=-1))  # (B, d_vec)
+    def forward(
+        self, f_t: torch.Tensor, loc: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        x     = self.trunk(torch.cat([f_t, loc], dim=-1))
+        v_t   = self.content_head(x)
+        delta = torch.tanh(self.move_head(x)) * self.move_scale
+        return v_t, delta  # (B, d_vec), (B, 2)
 
 
 # ---------------------------------------------------------------------------
@@ -145,26 +136,26 @@ class OutputNet(nn.Module):
 
 class SaccadeNet(nn.Module):
     """
-    Looped saccadic vision model — MobileNetV2 backbone edition.
+    Looped saccadic vision model — unified OutputNet edition.
 
-    Backbone is fully frozen; only MoveNet, LocTracker, OutputNet,
-    AuxLocHead, TaskHead, and the projection layer are trained.
-    This lets the movement policy learn against stable, discriminative
-    features from step 1 rather than fighting a randomly-initialized CNN.
+    MoveNet is removed. OutputNet now owns both content accumulation
+    and movement decisions via a shared trunk + two heads. This means
+    the same semantic reasoning that decides "what did I see" also
+    decides "where should I look next" — no goal mismatch.
 
     State at each step t:
         pos  (B, 2)        — current patch center in normalized [-1, 1] coords
         vec  (B, d_vec)    — accumulated content vector
+        loc  (B, d_loc)    — spatial context (previous step's LocTracker output)
         h    (1, B, d_loc) — LocTracker GRU hidden state
 
     Per loop step:
-        1. Extract patch at pos (differentiable via grid_sample)
-        2. f_t      = Backbone(patch)         — frozen features + trained proj
-        3. delta    = MoveNet(f_t, vec)        — where to go
-        4. pos      = clamp(pos + delta)
-        5. loc_t, h = LocTracker(actual_delta, h)
-        6. v_t      = OutputNet(f_t, loc_t)
-        7. vec      = vec + v_t
+        1. Extract patch at pos
+        2. f_t          = Backbone(patch)
+        3. v_t, delta   = OutputNet(f_t, loc)   ← loc from previous step
+        4. vec          = vec + v_t
+        5. pos          = clamp(pos + delta)
+        6. loc, h       = LocTracker(actual_delta, h)
 
     Output: task_head(vec_T) -> logits
     """
@@ -172,12 +163,11 @@ class SaccadeNet(nn.Module):
     def __init__(self, cfg: Config):
         super().__init__()
         self.cfg = cfg
-        self.backbone = MobileNetBackbone(cfg)
-        self.move_net = MoveNet(cfg)
-        self.loc_tracker = LocTracker(cfg)
+        self.backbone     = MobileNetBackbone(cfg)
+        self.loc_tracker  = LocTracker(cfg)
         self.aux_loc_head = AuxLocHead(cfg)
-        self.output_net = OutputNet(cfg)
-        self.task_head = nn.Linear(cfg.d_vec, cfg.num_classes)
+        self.output_net   = OutputNet(cfg)
+        self.task_head    = nn.Linear(cfg.d_vec, cfg.num_classes)
 
     def forward(self, x: torch.Tensor) -> tuple:
         """
@@ -203,6 +193,7 @@ class SaccadeNet(nn.Module):
             pos = torch.zeros(B, 2, device=device)  # center at val time
 
         vec   = torch.zeros(B, self.cfg.d_vec, device=device)
+        loc   = torch.zeros(B, self.cfg.d_loc, device=device)  # previous step's loc
         h     = torch.zeros(1, B, self.cfg.d_loc, device=device)
         pos_0 = pos.clone()
 
@@ -214,19 +205,20 @@ class SaccadeNet(nn.Module):
             patch = extract_patch(x, pos, self.cfg.patch_size, self.cfg.image_size)
             f_t   = self.backbone(patch)
 
-            delta = self.move_net(f_t, vec)
+            # OutputNet sees loc from previous step — drives both content and movement
+            v_t, delta = self.output_net(f_t, loc)
             delta_history.append(delta)
+            vec = vec + v_t
 
             new_pos      = clamp_pos(pos + delta, self.cfg.patch_size, self.cfg.image_size)
             actual_delta = new_pos - pos
             pos          = new_pos
 
-            loc_t, h = self.loc_tracker(actual_delta, h)
-            v_t      = self.output_net(f_t, loc_t)
-            vec      = vec + v_t
+            # Update loc for the next step
+            loc, h = self.loc_tracker(actual_delta, h)
 
             pos_history.append(pos)
-            aux_preds.append(self.aux_loc_head(loc_t))
+            aux_preds.append(self.aux_loc_head(loc))
 
         logits = self.task_head(vec)
         return logits, aux_preds, pos_history, pos_0, delta_history
@@ -242,10 +234,10 @@ class SaccadeNet(nn.Module):
         return {
             "backbone (frozen)":  n(self.backbone.features),
             "backbone_proj":      n(self.backbone.proj),
-            "move_net":           n(self.move_net),
             "loc_tracker":        n(self.loc_tracker),
             "aux_loc_head":       n(self.aux_loc_head),
-            "output_net":         n(self.output_net),
+            "output_net (trunk)": n(self.output_net.trunk),
+            "output_net (heads)": n(self.output_net.content_head) + n(self.output_net.move_head),
             "task_head":          n(self.task_head),
             "total_trainable":    n_trainable(self),
             "total_all":          n(self),
