@@ -18,7 +18,7 @@ class Config:
     move_scale: float = 0.15 # max delta per step (~17px); takes ~5 steps to cross image
 
     # --- Loss ---
-    loc_loss_weight: float = 0.1        # auxiliary location supervision
+    loc_loss_weight: float = 0.001        # auxiliary location supervision
     coverage_loss_weight: float = 0.05  # penalises low position variance across steps
 
     # --- Movement ---
