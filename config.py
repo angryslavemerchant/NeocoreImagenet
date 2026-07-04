@@ -45,7 +45,7 @@ class Config:
     resume: Optional[str] = None
 
     # --- Logging ---
-    wandb_project: str = "saccade-net"
+    wandb_project: str = "saccade-net-mobilnetv2"
     wandb_entity: Optional[str] = None
     log_interval: int = 50
 
