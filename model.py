@@ -14,9 +14,14 @@ class MobileNetBackbone(nn.Module):
     """
     Frozen MobileNetV2 feature extractor + trainable linear projection.
 
-    The backbone is permanently frozen — no gradients flow into it.
-    torch.no_grad() on the forward pass avoids storing activations for
-    backward, which saves significant memory across 16 loop steps.
+    Backbone parameters are frozen (requires_grad=False) so they don't
+    update, but gradients ARE allowed to flow through the frozen layers.
+    This is intentional — the novelty loss needs a gradient path from
+    f_t back through grid_sample into pos and into move_head. Blocking
+    grad flow with torch.no_grad() would sever that path entirely.
+
+    Memory note: storing 16 steps of backbone activations for backward
+    is the cost of this choice. Monitor GPU memory on first run.
 
     Only the projection layer (1280 -> d_feat) is trained, giving
     OutputNet a learned adapter onto the pretrained feature space.
@@ -36,10 +41,9 @@ class MobileNetBackbone(nn.Module):
         self.proj = nn.Linear(1280, cfg.d_feat)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        with torch.no_grad():
-            feat = self.features(x)             # (B, 1280, H', W')
-        feat = self.pool(feat).flatten(1)       # (B, 1280)
-        return self.proj(feat)                  # (B, d_feat)
+        feat = self.features(x)              # (B, 1280, H', W')
+        feat = self.pool(feat).flatten(1)    # (B, 1280)
+        return self.proj(feat)               # (B, d_feat)
 
 
 # ---------------------------------------------------------------------------
