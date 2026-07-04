@@ -175,11 +175,11 @@ class SaccadeNet(nn.Module):
             x: (B, C, H, W) input image batch
 
         Returns:
-            logits:        (B, num_classes)
-            aux_preds:     list[num_loops] of (B, 2) — predicted cumulative displacement
-            pos_history:   list[num_loops] of (B, 2) — actual patch centers
-            pos_0:         (B, 2) initial position
-            delta_history: list[num_loops] of (B, 2) — raw pre-clamp MoveNet deltas
+            logits:       (B, num_classes)
+            aux_preds:    list[num_loops] of (B, 2)      — predicted cumulative displacement
+            pos_history:  list[num_loops] of (B, 2)      — actual patch centers
+            pos_0:        (B, 2)                          — initial position
+            feat_history: list[num_loops] of (B, d_feat) — patch features for novelty loss
         """
         B = x.size(0)
         device = x.device
@@ -197,17 +197,17 @@ class SaccadeNet(nn.Module):
         h     = torch.zeros(1, B, self.cfg.d_loc, device=device)
         pos_0 = pos.clone()
 
-        aux_preds     = []
-        pos_history   = []
-        delta_history = []
+        aux_preds    = []
+        pos_history  = []
+        feat_history = []  # raw patch features — used for EMA novelty loss
 
         for _ in range(self.cfg.num_loops):
             patch = extract_patch(x, pos, self.cfg.patch_size, self.cfg.image_size)
             f_t   = self.backbone(patch)
+            feat_history.append(f_t)
 
             # OutputNet sees loc from previous step — drives both content and movement
             v_t, delta = self.output_net(f_t, loc)
-            delta_history.append(delta)
             vec = vec + v_t
 
             new_pos      = clamp_pos(pos + delta, self.cfg.patch_size, self.cfg.image_size)
@@ -221,7 +221,7 @@ class SaccadeNet(nn.Module):
             aux_preds.append(self.aux_loc_head(loc))
 
         logits = self.task_head(vec)
-        return logits, aux_preds, pos_history, pos_0, delta_history
+        return logits, aux_preds, pos_history, pos_0, feat_history
 
     def count_parameters(self) -> dict:
         """Parameter count breakdown. Backbone frozen params listed separately."""

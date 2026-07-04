@@ -43,24 +43,27 @@ def compute_loss(
     aux_preds: list,
     pos_history: list,
     pos_0: torch.Tensor,
-    delta_history: list,
+    feat_history: list,
     cfg: Config,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Total loss = CrossEntropy(logits, labels)
-               + loc_loss_weight    * mean_t( MSE(aux_pred_t, pos_t - pos_0) )
-               + coverage_loss_weight * hinge_coverage
+               + loc_loss_weight     * mean_t( MSE(aux_pred_t, pos_t - pos_0) )
+               + novelty_loss_weight * novelty_loss
 
-    Coverage loss — hinge on per-step movement magnitude (float32):
-        coverage_loss = relu(min_step - ||delta_t||).mean()
+    Novelty loss — cosine similarity between each step's features and an
+    EMA of all previous steps' features:
 
-    This replaces the broken variance formulation. Variance and its gradient
-    are both exactly zero at the degenerate (constant delta) solution, so it
-    cannot push the model out. The hinge has gradient -1 for every step below
-    the threshold — nonzero and constant even when delta is exactly zero.
+        ema_0   = f_0
+        loss_t  = cosine_similarity(f_t, ema_{t-1})   for t >= 1
+        ema_t   = alpha * ema_{t-1} + (1-alpha) * f_t
 
-    Computed in float32 explicitly: bfloat16 rounds small deltas to zero near
-    the collapse point, killing gradient signal even earlier than the math does.
+    High similarity = redundant patch = positive loss = gradient pushes away.
+    The EMA target is detached so gradients only flow through f_t, not back
+    through history — clean, stable signal: "be different from what came before."
+
+    Computed in float32: bfloat16 rounds small feature differences to zero
+    near collapse, killing the gradient exactly when it's needed most.
     """
     task_loss = F.cross_entropy(logits, labels)
 
@@ -70,15 +73,19 @@ def compute_loss(
         aux_loss  = aux_loss + F.mse_loss(aux_pred, true_disp)
     aux_loss = aux_loss / len(aux_preds)
 
-    # Hinge coverage loss — always computed in float32
-    deltas_f32    = torch.stack(delta_history, dim=1).float()  # (B, T, 2)
-    step_sizes    = deltas_f32.norm(dim=-1)                    # (B, T)
-    coverage_loss = F.relu(cfg.min_step - step_sizes).mean()   # zero when steps >= min_step
+    # EMA novelty loss — float32 throughout
+    ema          = feat_history[0].float().detach()  # start EMA from first patch
+    novelty_loss = torch.tensor(0.0, device=logits.device)
+    for f_t in feat_history[1:]:
+        f_t_f32      = f_t.float()
+        novelty_loss = novelty_loss + F.cosine_similarity(f_t_f32, ema, dim=-1).mean()
+        ema          = cfg.novelty_ema_alpha * ema + (1 - cfg.novelty_ema_alpha) * f_t_f32.detach()
+    novelty_loss = novelty_loss / max(len(feat_history) - 1, 1)
 
     total = (task_loss
-             + cfg.loc_loss_weight      * aux_loss
-             + cfg.coverage_loss_weight * coverage_loss)
-    return total, task_loss, aux_loss, coverage_loss
+             + cfg.loc_loss_weight     * aux_loss
+             + cfg.novelty_loss_weight * novelty_loss)
+    return total, task_loss, aux_loss, novelty_loss
 
 
 # ---------------------------------------------------------------------------
@@ -124,12 +131,12 @@ def train_one_epoch(
 ) -> tuple[float, float, float, int]:
     model.train()
 
-    losses      = AverageMeter()
-    task_losses = AverageMeter()
-    aux_losses  = AverageMeter()
-    cov_losses  = AverageMeter()
-    top1        = AverageMeter()
-    top5        = AverageMeter()
+    losses         = AverageMeter()
+    task_losses    = AverageMeter()
+    aux_losses     = AverageMeter()
+    novelty_losses = AverageMeter()
+    top1           = AverageMeter()
+    top5           = AverageMeter()
 
     pbar = tqdm(loader, desc=f"Epoch {epoch+1}/{cfg.num_epochs} [train]", leave=False)
 
@@ -139,9 +146,9 @@ def train_one_epoch(
         B = images.size(0)
 
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            logits, aux_preds, pos_history, pos_0, delta_history = model(images)
-            loss, task_loss, aux_loss, coverage_loss = compute_loss(
-                logits, labels, aux_preds, pos_history, pos_0, delta_history, cfg
+            logits, aux_preds, pos_history, pos_0, feat_history = model(images)
+            loss, task_loss, aux_loss, novelty_loss = compute_loss(
+                logits, labels, aux_preds, pos_history, pos_0, feat_history, cfg
             )
 
         optimizer.zero_grad()
@@ -155,25 +162,29 @@ def train_one_epoch(
         losses.update(loss.item(), B)
         task_losses.update(task_loss.item(), B)
         aux_losses.update(aux_loss.item(), B)
-        cov_losses.update(coverage_loss.item(), B)
+        novelty_losses.update(novelty_loss.item(), B)
         top1.update(acc1, B)
         top5.update(acc5, B)
 
         pbar.set_postfix(loss=f"{losses.avg:.3f}", top1=f"{top1.avg:.1f}%",
-                         cov=f"{cov_losses.avg:.4f}")
+                         nov=f"{novelty_losses.avg:.3f}")
 
         if global_step % cfg.log_interval == 0:
-            # Also log mean step size for easy diagnosis of movement collapse
+            # Mean step size from position history — movement diagnostic
             with torch.no_grad():
-                deltas_f32 = torch.stack(delta_history, dim=1).float()
-                mean_step  = deltas_f32.norm(dim=-1).mean().item()
+                if len(pos_history) > 1:
+                    positions  = torch.stack(pos_history, dim=1).float()  # (B, T, 2)
+                    step_sizes = (positions[:, 1:] - positions[:, :-1]).norm(dim=-1)
+                    mean_step  = step_sizes.mean().item()
+                else:
+                    mean_step = 0.0
 
             wandb.log({
                 "train/loss":          losses.avg,
                 "train/task_loss":     task_losses.avg,
                 "train/aux_loss":      aux_losses.avg,
-                "train/coverage_loss": cov_losses.avg,  # hinge: 0 = all steps ok
-                "train/mean_step_size": mean_step,       # direct movement diagnostic
+                "train/novelty_loss":  novelty_losses.avg,  # 0=max novelty, 1=identical patches
+                "train/mean_step_size": mean_step,
                 "train/top1":          top1.avg,
                 "train/top5":          top5.avg,
                 "train/grad_scale":    scaler.get_scale(),
@@ -207,9 +218,9 @@ def validate(
         B = images.size(0)
 
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            logits, aux_preds, pos_history, pos_0, delta_history = model(images)
+            logits, aux_preds, pos_history, pos_0, feat_history = model(images)
             loss, _, _, _ = compute_loss(
-                logits, labels, aux_preds, pos_history, pos_0, delta_history, cfg
+                logits, labels, aux_preds, pos_history, pos_0, feat_history, cfg
             )
 
         acc1, acc5 = accuracy(logits.float(), labels, topk=(1, 5))
