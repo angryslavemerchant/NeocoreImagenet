@@ -27,7 +27,7 @@ class Config:
     random_start: bool = True
 
     # --- Training ---
-    batch_size: int = 2048
+    batch_size: int = 512
     num_epochs: int = 90
     lr: float = 4e-3
     weight_decay: float = 0.05
