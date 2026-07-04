@@ -10,8 +10,14 @@ import wandb
 from torch.cuda.amp import GradScaler
 from tqdm import tqdm
 
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+import numpy as np
+
 from config import Config
-from dataset import get_dataloaders
+from dataset import get_dataloaders, IMAGENET_MEAN, IMAGENET_STD
 from model import SaccadeNet
 from utils import AverageMeter, accuracy
 
@@ -206,6 +212,91 @@ def validate(
     return losses.avg, top1.avg, top5.avg
 
 
+
+# ---------------------------------------------------------------------------
+# Per-epoch trajectory visualisation
+# ---------------------------------------------------------------------------
+
+def _denormalize(tensor: torch.Tensor) -> np.ndarray:
+    mean = torch.tensor(IMAGENET_MEAN).view(3, 1, 1)
+    std  = torch.tensor(IMAGENET_STD).view(3, 1, 1)
+    img  = (tensor.cpu() * std + mean).clamp(0, 1)
+    return img.permute(1, 2, 0).numpy()
+
+
+@torch.no_grad()
+def visualize_epoch_trajectories(
+    model: nn.Module,
+    loader,
+    cfg: Config,
+    device: torch.device,
+    epoch: int,
+    global_step: int,
+    n_images: int = 8,
+):
+    """
+    Grab the first n_images from the val loader, run a forward pass,
+    render the patch trajectory on each image, and log as a wandb image grid.
+    Called once per epoch so you can watch movement develop over training.
+    """
+    model.eval()
+
+    # Pull one batch — we only need the first n_images
+    images, labels = next(iter(loader))
+    images = images[:n_images].to(device)
+    labels = labels[:n_images].to(device)
+
+    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        logits, _, pos_history, pos_0 = model(images)
+
+    preds   = logits.float().argmax(dim=1)
+    H = W   = cfg.image_size
+    half    = cfg.patch_size / 2
+    colors  = plt.cm.plasma(np.linspace(0.1, 0.9, cfg.num_loops))
+
+    fig, axes = plt.subplots(2, n_images // 2, figsize=(3 * (n_images // 2), 7))
+    axes = axes.flatten()
+
+    for idx in range(n_images):
+        ax  = axes[idx]
+        img = _denormalize(images[idx].cpu().float())
+        ax.imshow(img)
+        ax.axis("off")
+
+        correct = preds[idx].item() == labels[idx].item()
+        ax.set_title(
+            f"{'✓' if correct else '✗'} p={preds[idx].item()} t={labels[idx].item()}",
+            fontsize=7,
+            color="green" if correct else "red",
+        )
+
+        prev_cx, prev_cy = None, None
+        for t, (pos, color) in enumerate(zip(pos_history, colors)):
+            cx = (pos[idx][0].item() + 1) / 2 * (W - 1)
+            cy = (pos[idx][1].item() + 1) / 2 * (H - 1)
+
+            rect = mpatches.Rectangle(
+                (cx - half, cy - half), cfg.patch_size, cfg.patch_size,
+                linewidth=1.2, edgecolor=color, facecolor="none", alpha=0.8,
+            )
+            ax.add_patch(rect)
+            ax.text(cx, cy, str(t), fontsize=5, ha="center", va="center",
+                    color=color, fontweight="bold")
+
+            if prev_cx is not None:
+                ax.annotate("", xy=(cx, cy), xytext=(prev_cx, prev_cy),
+                            arrowprops=dict(arrowstyle="->", color=color, lw=0.8))
+            prev_cx, prev_cy = cx, cy
+
+    fig.suptitle(f"Epoch {epoch+1} — patch trajectories (dark=early, light=late)", fontsize=9)
+    plt.tight_layout()
+
+    # Log to wandb as a single image
+    wandb.log({"val/trajectories": wandb.Image(fig)}, step=global_step)
+    plt.close(fig)
+
+    model.train()
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -227,9 +318,6 @@ def main():
 
     # Model
     model = SaccadeNet(cfg).to(device)
-
-    torch.compile(model)
-
     param_counts = model.count_parameters()
     print("\nParameter counts:")
     for name, count in param_counts.items():
@@ -288,6 +376,9 @@ def main():
         )
         val_loss, val_top1, val_top5 = validate(
             model, val_loader, cfg, epoch, device, global_step
+        )
+        visualize_epoch_trajectories(
+            model, val_loader, cfg, device, epoch, global_step
         )
         scheduler.step()
 
