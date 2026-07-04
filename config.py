@@ -6,32 +6,34 @@ from typing import Optional
 class Config:
     # --- Image / patch ---
     image_size: int = 224
-    patch_size: int = 64         # 64px = ~29% of image width, enough to see structure
+    patch_size: int = 64
     in_channels: int = 3
 
     # --- Model dimensions ---
-    d_feat: int = 384       # CNN output / feature dim
+    d_feat: int = 384       # backbone projection output dim
     d_vec: int = 384        # accumulated output vector dim
     d_loc: int = 128        # LocTracker hidden / output dim
-    num_loops: int = 8
+    num_loops: int = 16
     num_classes: int = 100
-    move_scale: float = 0.5# max delta per step (~17px); takes ~5 steps to cross image
+    move_scale: float = 0.15
 
     # --- Loss ---
-    loc_loss_weight: float = 0.001        # auxiliary location supervision
-    coverage_loss_weight: float = 0.05   # penalises low position variance across steps
+    loc_loss_weight: float = 0.1
+    coverage_loss_weight: float = 0.05
+    min_step: float = 0.05  # hinge threshold — steps smaller than this are penalized
+                            # 0.05 in normalized coords ≈ 5px on a 224px image
 
     # --- Movement ---
-    random_start: bool = True  # randomise pos_0 during training to break corner shortcuts
+    random_start: bool = True
 
     # --- Training ---
-    batch_size: int = 1024
+    batch_size: int = 2048
     num_epochs: int = 90
-    lr: float = 3e-3
+    lr: float = 4e-3
     weight_decay: float = 0.05
     grad_clip: float = 1.0
     warmup_epochs: int = 10
-    num_workers: int = 8
+    num_workers: int = 12
 
     # --- Data ---
     dataset_name: str = "clane9/imagenet-100"

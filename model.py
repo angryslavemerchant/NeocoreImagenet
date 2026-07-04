@@ -1,71 +1,50 @@
 import torch
 import torch.nn as nn
+from torchvision.models import mobilenet_v2, MobileNet_V2_Weights
 
 from config import Config
 from utils import extract_patch, clamp_pos
 
 
 # ---------------------------------------------------------------------------
-# Building blocks
+# Backbone
 # ---------------------------------------------------------------------------
 
-class DepthwiseSeparableConv(nn.Module):
+class MobileNetBackbone(nn.Module):
     """
-    Depthwise separable convolution: depthwise -> BN -> ReLU -> pointwise -> BN -> ReLU.
-    Significantly fewer parameters than a standard conv at similar representational power.
-    """
+    Frozen MobileNetV2 feature extractor + trainable linear projection.
 
-    def __init__(self, in_ch: int, out_ch: int, stride: int = 1):
-        super().__init__()
-        self.block = nn.Sequential(
-            # Depthwise: one filter per input channel
-            nn.Conv2d(in_ch, in_ch, 3, stride=stride, padding=1, groups=in_ch, bias=False),
-            nn.BatchNorm2d(in_ch),
-            nn.ReLU(inplace=True),
-            # Pointwise: mix channels
-            nn.Conv2d(in_ch, out_ch, 1, bias=False),
-            nn.BatchNorm2d(out_ch),
-            nn.ReLU(inplace=True),
-        )
+    The backbone is permanently frozen — no gradients flow into it.
+    torch.no_grad() on the forward pass avoids storing activations for
+    backward, which saves significant memory across 16 loop steps.
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.block(x)
+    Only the projection layer (1280 -> d_feat) is trained, giving MoveNet
+    and OutputNet a learned adapter onto the pretrained feature space.
 
-
-# ---------------------------------------------------------------------------
-# Subnetworks
-# ---------------------------------------------------------------------------
-
-class PatchCNN(nn.Module):
-    """
-    Extracts features from a single patch.
-
-    Input:  (B, C, patch_size, patch_size)
+    Input:  (B, C, patch_size, patch_size)  — works fine for 64px patches
     Output: (B, d_feat)
-
-    Architecture: standard conv stem -> depthwise separable stack -> global avg pool.
-    Weight-shared across all loop steps — the same parameters see every patch.
     """
 
     def __init__(self, cfg: Config):
         super().__init__()
-        self.net = nn.Sequential(
-            # Standard conv stem for initial channel expansion
-            nn.Conv2d(cfg.in_channels, 32, 3, padding=1, bias=False),
-            nn.BatchNorm2d(32),
-            nn.ReLU(inplace=True),
-            # Depthwise separable stack
-            DepthwiseSeparableConv(32, 64),                      # 32x32
-            DepthwiseSeparableConv(64, 128, stride=2),           # -> 16x16
-            DepthwiseSeparableConv(128, 256, stride=2),          # -> 8x8
-            DepthwiseSeparableConv(256, 384, stride=2),          # -> 4x4
-            DepthwiseSeparableConv(384, cfg.d_feat),             # 4x4
-        )
+        backbone = mobilenet_v2(weights=MobileNet_V2_Weights.DEFAULT)
+        self.features = backbone.features   # (B, 1280, H', W') out
+        for p in self.features.parameters():
+            p.requires_grad = False
+
         self.pool = nn.AdaptiveAvgPool2d(1)
+        self.proj = nn.Linear(1280, cfg.d_feat)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.pool(self.net(x)).flatten(1)  # (B, d_feat)
+        with torch.no_grad():
+            feat = self.features(x)             # (B, 1280, H', W')
+        feat = self.pool(feat).flatten(1)       # (B, 1280)
+        return self.proj(feat)                  # (B, d_feat)
 
+
+# ---------------------------------------------------------------------------
+# Subnetworks  (unchanged from original)
+# ---------------------------------------------------------------------------
 
 class MoveNet(nn.Module):
     """
@@ -99,13 +78,8 @@ class LocTracker(nn.Module):
     """
     Learned dead-reckoning: tracks relative position from movement history alone.
 
-    This is intentionally a blind tracker — it never sees absolute image coordinates,
-    only the sequence of actual (post-clamp) deltas. Whatever spatial representation
-    emerges in its hidden state is driven purely by task loss and the auxiliary
-    position supervision signal.
-
-    Input per step:  actual_delta (B, 2) — movement that actually happened after clamping
-    Output per step: loc_t (B, d_loc) — relative position encoding for this step
+    Input per step:  actual_delta (B, 2)
+    Output per step: loc_t (B, d_loc)
     """
 
     def __init__(self, cfg: Config):
@@ -122,17 +96,14 @@ class LocTracker(nn.Module):
         actual_delta: torch.Tensor,  # (B, 2)
         h: torch.Tensor,             # (1, B, d_loc)
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        # GRU expects (seq_len, B, input_size); we process one step at a time
-        out, h = self.gru(actual_delta.unsqueeze(0), h)  # out: (1, B, d_loc)
-        return out.squeeze(0), h                          # loc_t: (B, d_loc)
+        out, h = self.gru(actual_delta.unsqueeze(0), h)
+        return out.squeeze(0), h     # loc_t: (B, d_loc)
 
 
 class AuxLocHead(nn.Module):
     """
     Auxiliary linear head: loc_t -> predicted 2D displacement from start.
-
-    Used only during training. Provides a direct supervision signal to LocTracker
-    so its hidden state is anchored to real spatial meaning. Dropped at inference.
+    Training only — dropped at inference.
     """
 
     def __init__(self, cfg: Config):
@@ -148,8 +119,8 @@ class OutputNet(nn.Module):
     Combines patch features with spatial context to produce each step's
     contribution to the accumulated output vector.
 
-    Input:  f_t (B, d_feat) concat loc_t (B, d_loc) -> (B, d_feat + d_loc)
-    Output: v_t (B, d_vec) — added to vec at each loop step
+    Input:  f_t (B, d_feat) concat loc_t (B, d_loc)
+    Output: v_t (B, d_vec)
     """
 
     def __init__(self, cfg: Config):
@@ -174,22 +145,26 @@ class OutputNet(nn.Module):
 
 class SaccadeNet(nn.Module):
     """
-    Looped saccadic vision model.
+    Looped saccadic vision model — MobileNetV2 backbone edition.
+
+    Backbone is fully frozen; only MoveNet, LocTracker, OutputNet,
+    AuxLocHead, TaskHead, and the projection layer are trained.
+    This lets the movement policy learn against stable, discriminative
+    features from step 1 rather than fighting a randomly-initialized CNN.
 
     State at each step t:
-        pos  (B, 2)       — current patch center in normalized [-1, 1] coords
-        vec  (B, d_vec)   — accumulated content vector (what has been seen)
-        h    (1, B, d_loc)— LocTracker GRU hidden state (where relative to start)
+        pos  (B, 2)        — current patch center in normalized [-1, 1] coords
+        vec  (B, d_vec)    — accumulated content vector
+        h    (1, B, d_loc) — LocTracker GRU hidden state
 
     Per loop step:
         1. Extract patch at pos (differentiable via grid_sample)
-        2. f_t     = CNN(patch)
-        3. delta   = MoveNet(f_t, vec)        — where to go
-        4. pos     = clamp(pos + delta)       — apply + stay in bounds
-        5. actual_delta = new_pos - old_pos   — what actually happened
-        6. loc_t, h = LocTracker(actual_delta, h)
-        7. v_t     = OutputNet(f_t, loc_t)
-        8. vec     = vec + v_t
+        2. f_t      = Backbone(patch)         — frozen features + trained proj
+        3. delta    = MoveNet(f_t, vec)        — where to go
+        4. pos      = clamp(pos + delta)
+        5. loc_t, h = LocTracker(actual_delta, h)
+        6. v_t      = OutputNet(f_t, loc_t)
+        7. vec      = vec + v_t
 
     Output: task_head(vec_T) -> logits
     """
@@ -197,7 +172,7 @@ class SaccadeNet(nn.Module):
     def __init__(self, cfg: Config):
         super().__init__()
         self.cfg = cfg
-        self.cnn = PatchCNN(cfg)
+        self.backbone = MobileNetBackbone(cfg)
         self.move_net = MoveNet(cfg)
         self.loc_tracker = LocTracker(cfg)
         self.aux_loc_head = AuxLocHead(cfg)
@@ -211,59 +186,45 @@ class SaccadeNet(nn.Module):
 
         Returns:
             logits:        (B, num_classes)
-            aux_preds:     list of num_loops tensors, each (B, 2)
-                           predicted cumulative displacement from start at each step
-            pos_history:   list of num_loops tensors, each (B, 2)
-                           actual patch center positions at each step
+            aux_preds:     list[num_loops] of (B, 2) — predicted cumulative displacement
+            pos_history:   list[num_loops] of (B, 2) — actual patch centers
             pos_0:         (B, 2) initial position
-            delta_history: list of num_loops tensors, each (B, 2)
-                           raw pre-clamp deltas from MoveNet (used for coverage loss)
+            delta_history: list[num_loops] of (B, 2) — raw pre-clamp MoveNet deltas
         """
         B = x.size(0)
         device = x.device
 
-        # Initialize state
-        # Random start during training breaks the "slam to corner and stay" degenerate
-        # solution by ensuring MoveNet can't learn a fixed absolute policy.
         if self.cfg.random_start and self.training:
             pixel_size = 2.0 / (self.cfg.image_size - 1)
-            half_patch  = (self.cfg.patch_size - 1) / 2.0 * pixel_size
+            half_patch = (self.cfg.patch_size - 1) / 2.0 * pixel_size
             lo, hi = -1.0 + half_patch, 1.0 - half_patch
             pos = torch.zeros(B, 2, device=device).uniform_(lo, hi)
         else:
             pos = torch.zeros(B, 2, device=device)  # center at val time
-        vec = torch.zeros(B, self.cfg.d_vec, device=device)
-        h   = torch.zeros(1, B, self.cfg.d_loc, device=device)
+
+        vec   = torch.zeros(B, self.cfg.d_vec, device=device)
+        h     = torch.zeros(1, B, self.cfg.d_loc, device=device)
         pos_0 = pos.clone()
 
-        aux_preds    = []
-        pos_history  = []
-        delta_history = []  # raw pre-clamp deltas for coverage loss
+        aux_preds     = []
+        pos_history   = []
+        delta_history = []
 
         for _ in range(self.cfg.num_loops):
-            # 1. Extract patch at current position
             patch = extract_patch(x, pos, self.cfg.patch_size, self.cfg.image_size)
+            f_t   = self.backbone(patch)
 
-            # 2. Features from patch
-            f_t = self.cnn(patch)
-
-            # 3. Predict movement
             delta = self.move_net(f_t, vec)
-            delta_history.append(delta)  # store before clamping — gradients flow freely here
+            delta_history.append(delta)
 
-            # 4. Apply and clamp
-            new_pos = clamp_pos(pos + delta, self.cfg.patch_size, self.cfg.image_size)
-            actual_delta = new_pos - pos  # what movement actually happened post-clamp
-            pos = new_pos
+            new_pos      = clamp_pos(pos + delta, self.cfg.patch_size, self.cfg.image_size)
+            actual_delta = new_pos - pos
+            pos          = new_pos
 
-            # 5. Update location tracker with actual (not requested) delta
             loc_t, h = self.loc_tracker(actual_delta, h)
+            v_t      = self.output_net(f_t, loc_t)
+            vec      = vec + v_t
 
-            # 6. Output contribution
-            v_t = self.output_net(f_t, loc_t)
-            vec = vec + v_t
-
-            # Record for loss and visualization
             pos_history.append(pos)
             aux_preds.append(self.aux_loc_head(loc_t))
 
@@ -271,16 +232,21 @@ class SaccadeNet(nn.Module):
         return logits, aux_preds, pos_history, pos_0, delta_history
 
     def count_parameters(self) -> dict:
-        """Parameter count breakdown by subnetwork."""
+        """Parameter count breakdown. Backbone frozen params listed separately."""
         def n(module):
             return sum(p.numel() for p in module.parameters())
 
+        def n_trainable(module):
+            return sum(p.numel() for p in module.parameters() if p.requires_grad)
+
         return {
-            "cnn":          n(self.cnn),
-            "move_net":     n(self.move_net),
-            "loc_tracker":  n(self.loc_tracker),
-            "aux_loc_head": n(self.aux_loc_head),
-            "output_net":   n(self.output_net),
-            "task_head":    n(self.task_head),
-            "total":        n(self),
+            "backbone (frozen)":  n(self.backbone.features),
+            "backbone_proj":      n(self.backbone.proj),
+            "move_net":           n(self.move_net),
+            "loc_tracker":        n(self.loc_tracker),
+            "aux_loc_head":       n(self.aux_loc_head),
+            "output_net":         n(self.output_net),
+            "task_head":          n(self.task_head),
+            "total_trainable":    n_trainable(self),
+            "total_all":          n(self),
         }
