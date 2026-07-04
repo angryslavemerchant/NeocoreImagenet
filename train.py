@@ -43,6 +43,7 @@ def compute_loss(
     aux_preds: list,
     pos_history: list,
     pos_0: torch.Tensor,
+    delta_history: list,
     cfg: Config,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
@@ -64,11 +65,13 @@ def compute_loss(
         aux_loss = aux_loss + F.mse_loss(aux_pred, true_disp)
     aux_loss = aux_loss / len(aux_preds)
 
-    # Coverage loss: penalise low variance in patch positions across steps.
-    # If the model camps in one spot, var -> 0 and this term is maximally penalised.
-    # Detach positions so this only pushes MoveNet, not the CNN or OutputNet.
-    positions = torch.stack([p.detach() for p in pos_history], dim=1)  # (B, T, 2)
-    coverage_loss = -positions.var(dim=1).mean()
+    # Coverage loss on raw pre-clamp deltas from MoveNet.
+    # Using deltas (not positions) means:
+    #   - no .detach() needed — gradients flow directly into MoveNet
+    #   - no clamp() gradient blocking at image boundaries
+    # Penalises MoveNet for outputting the same delta every step.
+    deltas = torch.stack(delta_history, dim=1)   # (B, T, 2)
+    coverage_loss = -deltas.var(dim=1).mean()
 
     total = (task_loss
              + cfg.loc_loss_weight * aux_loss
@@ -134,9 +137,9 @@ def train_one_epoch(
 
         # Forward in bfloat16
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            logits, aux_preds, pos_history, pos_0 = model(images)
+            logits, aux_preds, pos_history, pos_0, delta_history = model(images)
             loss, task_loss, aux_loss, coverage_loss = compute_loss(
-                logits, labels, aux_preds, pos_history, pos_0, cfg
+                logits, labels, aux_preds, pos_history, pos_0, delta_history, cfg
             )
 
         optimizer.zero_grad()
@@ -194,8 +197,8 @@ def validate(
         B = images.size(0)
 
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            logits, aux_preds, pos_history, pos_0 = model(images)
-            loss, _, _, _ = compute_loss(logits, labels, aux_preds, pos_history, pos_0, cfg)
+            logits, aux_preds, pos_history, pos_0, delta_history = model(images)
+            loss, _, _, _ = compute_loss(logits, labels, aux_preds, pos_history, pos_0, delta_history, cfg)
 
         acc1, acc5 = accuracy(logits.float(), labels, topk=(1, 5))
         losses.update(loss.item(), B)
@@ -247,7 +250,7 @@ def visualize_epoch_trajectories(
     labels = labels[:n_images].to(device)
 
     with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-        logits, _, pos_history, pos_0 = model(images)
+        logits, _, pos_history, pos_0, _ = model(images)
 
     preds   = logits.float().argmax(dim=1)
     H = W   = cfg.image_size
@@ -318,9 +321,6 @@ def main():
 
     # Model
     model = SaccadeNet(cfg).to(device)
-
-    torch.compile(model)
-
     param_counts = model.count_parameters()
     print("\nParameter counts:")
     for name, count in param_counts.items():

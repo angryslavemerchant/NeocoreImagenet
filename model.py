@@ -210,12 +210,14 @@ class SaccadeNet(nn.Module):
             x: (B, C, H, W) input image batch
 
         Returns:
-            logits:      (B, num_classes)
-            aux_preds:   list of num_loops tensors, each (B, 2)
-                         predicted cumulative displacement from start at each step
-            pos_history: list of num_loops tensors, each (B, 2)
-                         actual patch center positions at each step
-            pos_0:       (B, 2) initial position (all zeros = image center)
+            logits:        (B, num_classes)
+            aux_preds:     list of num_loops tensors, each (B, 2)
+                           predicted cumulative displacement from start at each step
+            pos_history:   list of num_loops tensors, each (B, 2)
+                           actual patch center positions at each step
+            pos_0:         (B, 2) initial position
+            delta_history: list of num_loops tensors, each (B, 2)
+                           raw pre-clamp deltas from MoveNet (used for coverage loss)
         """
         B = x.size(0)
         device = x.device
@@ -234,8 +236,9 @@ class SaccadeNet(nn.Module):
         h   = torch.zeros(1, B, self.cfg.d_loc, device=device)
         pos_0 = pos.clone()
 
-        aux_preds   = []
-        pos_history = []
+        aux_preds    = []
+        pos_history  = []
+        delta_history = []  # raw pre-clamp deltas for coverage loss
 
         for _ in range(self.cfg.num_loops):
             # 1. Extract patch at current position
@@ -246,6 +249,7 @@ class SaccadeNet(nn.Module):
 
             # 3. Predict movement
             delta = self.move_net(f_t, vec)
+            delta_history.append(delta)  # store before clamping — gradients flow freely here
 
             # 4. Apply and clamp
             new_pos = clamp_pos(pos + delta, self.cfg.patch_size, self.cfg.image_size)
@@ -264,7 +268,7 @@ class SaccadeNet(nn.Module):
             aux_preds.append(self.aux_loc_head(loc_t))
 
         logits = self.task_head(vec)
-        return logits, aux_preds, pos_history, pos_0
+        return logits, aux_preds, pos_history, pos_0, delta_history
 
     def count_parameters(self) -> dict:
         """Parameter count breakdown by subnetwork."""

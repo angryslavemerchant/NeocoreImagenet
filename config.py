@@ -30,7 +30,7 @@ class Config:
     lr: float = 3e-3
     weight_decay: float = 0.05
     grad_clip: float = 1.0
-    warmup_epochs: int = 5
+    warmup_epochs: int = 10
     num_workers: int = 8
 
     # --- Data ---

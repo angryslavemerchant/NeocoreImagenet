@@ -132,7 +132,7 @@ def evaluate(
     _debug_images, _ = next(iter(val_loader))
     _debug_images = _debug_images.to(device)
     with torch.no_grad():
-        _, _, _pos_history, _pos_0 = model(_debug_images)
+        _, _, _pos_history, _pos_0, _ = model(_debug_images)
     for img_idx in range(min(3, _debug_images.size(0))):
         print(f"  image {img_idx}  start: [{_pos_0[img_idx][0].item():.3f}, {_pos_0[img_idx][1].item():.3f}]")
         for t, pos in enumerate(_pos_history):
@@ -144,7 +144,7 @@ def evaluate(
         images = images.to(device)
         labels = labels.to(device)
 
-        logits, _, pos_history, _ = model(images)
+        logits, _, pos_history, _, _ = model(images)
 
         acc1, acc5 = accuracy(logits, labels, topk=(1, 5))
         B = images.size(0)
