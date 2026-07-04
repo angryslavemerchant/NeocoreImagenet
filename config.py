@@ -27,7 +27,7 @@ class Config:
     # --- Training ---
     batch_size: int = 1024
     num_epochs: int = 90
-    lr: float = 34e-3
+    lr: float = 3e-3
     weight_decay: float = 0.05
     grad_clip: float = 1.0
     warmup_epochs: int = 5
