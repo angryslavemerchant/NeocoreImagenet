@@ -38,6 +38,8 @@ def build_model(args) -> ASFNet2:
         target_group_size_2  = args.target_group_size_2,
         router_proj_dim      = args.router_proj_dim,
         knn_k                = args.knn_k,
+        local_encoder1       = args.local_encoder1,
+        local_radius         = args.local_radius,
     )
 
 

@@ -62,6 +62,8 @@ def _load_model(path: str, device: torch.device) -> tuple[ASFNet2, dict]:
         target_group_size_2 = a["target_group_size_2"],
         router_proj_dim     = a["router_proj_dim"],
         knn_k               = a["knn_k"],
+        local_encoder1      = a.get("local_encoder1", False),
+        local_radius        = a.get("local_radius", 1),
     )
     model.load_state_dict(ckpt["model"])
     model.to(device).eval()
@@ -533,9 +535,6 @@ def main():
 
     grid_size  = ckpt_args["image_size"] // ckpt_args["patch_size"]
     patch_size = ckpt_args["patch_size"]
-
-    local_encoder1 = args.get("local_encoder1", False),
-    local_radius = args.get("local_radius", 1),
 
     if not args.no_accuracy:
         run_accuracy(model, val_loader, device)
