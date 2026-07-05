@@ -249,23 +249,36 @@ def gpu_connected_components_dynamic(
 
 class BoundaryRouter2(nn.Module):
     """
-    Stage 2 boundary router. Identical learned weights to BoundaryRouter
-    (Stage 1) but accepts dynamic per-image edges instead of a fixed grid
-    buffer, and computes a topology-aware ratio loss that accounts for
-    the varying token and edge counts at Stage 2.
+    Stage 2 router — the same H-Net-faithful RoutingModule as Stage 1
+    (identity-initialised d_model projections, parameter-free boundary
+    probability p = clamp((1 - cos_sim)/2, 0, 1)), adapted to dynamic per-image
+    k-NN edges instead of a fixed grid buffer.
 
-    Because token count (n_tokens) and valid edge count (n_edges) vary
-    per image at Stage 2 (unlike Stage 1 where every image has exactly
-    N=196 tokens and 364 edges), the ratio loss is computed per image
-    and averaged — a small Python loop over B images on scalar tensors,
-    negligible cost.
+    See BoundaryRouter in model_asfnet.py for the full rationale on why the
+    router is parameter-free and identity-initialised, and for which parts are
+    faithful to H-Net vs. deliberate 2D deviations. This class differs only in
+    edge handling and in that the load-balancing target is computed per image,
+    because Stage 1 emits a variable number of real groups per image (so
+    n_tokens and the valid edge count vary across the batch).
+
+    The per-image loss is fully vectorised — no Python loop over the batch.
+
+    proj_dim is accepted for backward compatibility but IGNORED (projections are
+    always full d_model, per H-Net).
     """
 
-    def __init__(self, d_model: int, proj_dim: int = 64):
+    def __init__(self, d_model: int, proj_dim: int = None):
         super().__init__()
-        self.W_q           = nn.Linear(d_model, proj_dim, bias=False)
-        self.W_k           = nn.Linear(d_model, proj_dim, bias=False)
-        self.score_to_prob = nn.Linear(1, 1)
+        self.d_model = d_model
+
+        # Identity-initialised projections (H-Net RoutingModule).
+        self.q_proj = nn.Linear(d_model, d_model, bias=False)
+        self.k_proj = nn.Linear(d_model, d_model, bias=False)
+        with torch.no_grad():
+            self.q_proj.weight.copy_(torch.eye(d_model))
+            self.k_proj.weight.copy_(torch.eye(d_model))
+        self.q_proj.weight._no_reinit = True
+        self.k_proj.weight._no_reinit = True
 
     def forward(
         self,
@@ -278,67 +291,54 @@ class BoundaryRouter2(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Returns:
-            hard:    (B, E) binary boundary decisions (STE — Straight-Through
-                     Estimator, meaning the forward pass uses hard 0/1 decisions
-                     while gradients flow through the soft probabilities)
+            hard:    (B, E) binary boundary decisions (caller detaches for CC)
             probs:   (B, E) soft boundary probabilities
-            l_ratio: scalar ratio loss averaged across the batch
+            l_ratio: scalar load-balancing loss averaged across valid images
         """
-        q = self.W_q(h)   # (B, G1, proj_dim)
-        k = self.W_k(h)   # (B, G1, proj_dim)
+        q = self.q_proj(h)   # (B, G1, D)
+        k = self.k_proj(h)   # (B, G1, D)
 
-        proj_dim = q.shape[-1]
-        q_i = q.gather(1, src.unsqueeze(-1).expand(-1, -1, proj_dim))   # (B, E, proj_dim)
-        k_j = k.gather(1, dst.unsqueeze(-1).expand(-1, -1, proj_dim))   # (B, E, proj_dim)
+        D_dim = q.shape[-1]
+        q_i = q.gather(1, src.unsqueeze(-1).expand(-1, -1, D_dim))   # (B, E, D)
+        k_j = k.gather(1, dst.unsqueeze(-1).expand(-1, -1, D_dim))   # (B, E, D)
 
-        sim   = F.cosine_similarity(q_i, k_j, dim=-1)     # (B, E)
-        D     = (1.0 - sim).unsqueeze(-1)                 # (B, E, 1)
-        probs = torch.sigmoid(self.score_to_prob(D)).squeeze(-1)   # (B, E)
+        cos   = F.cosine_similarity(q_i, k_j, dim=-1).clamp(-1.0, 1.0)   # (B, E)
+        probs = ((1.0 - cos) / 2.0).clamp(0.0, 1.0)                       # (B, E)
+        hard  = (probs > 0.5).float()                                     # (B, E)
 
-        # Straight-Through Estimator: hard decision forward, soft gradient backward
-        hard = (probs > 0.5).float() + probs - probs.detach()   # (B, E)
-
-        # --- Per-image ratio loss ---
+        # --- Per-image load-balancing loss (vectorised) ---
         #
-        # Same spanning-forest formula as Stage 1 (see BoundaryRouter in
-        # model_asfnet.py for the full derivation), but n_tokens and n_edges
-        # are image-specific at Stage 2 because Stage 1 produces a variable
-        # number of real groups per image.
-        #
-        # F_target = (n_edges - n_tokens + G_target) / n_edges
-        # where G_target = n_tokens / target_group_size
-        #
-        # This keeps F_target above the percolation threshold regardless of
-        # how many real tokens this particular image has at Stage 2.
-        B = h.shape[0]
-        l_ratio_total = h.new_zeros(())
-        n_valid_images = 0
+        # Spanning-forest target per image (n_tokens, n_edges are image-specific
+        # at Stage 2 because Stage 1 emits a variable number of real groups):
+        #     G_target = n_tokens / target_group_size
+        #     F_target = (n_edges - n_tokens + G_target) / n_edges
+        #     N        = 1 / F_target
+        # then fed into the shared load_balancing_loss. F_rate and G_rate are
+        # masked means over each image's VALID edges only.
+        valid_f = valid.float()                                  # (B, E)
+        n_edge  = valid_f.sum(dim=1)                             # (B,)
+        n_tok   = n_real_per_image.float()                      # (B,)
 
-        for b in range(B):
-            n_tok  = float(n_real_per_image[b].item())
-            n_edge = float(valid[b].sum().item())
+        safe_edge = n_edge.clamp(min=1.0)
+        F_rate = (hard.detach() * valid_f).sum(dim=1) / safe_edge   # (B,)
+        G_rate = (probs        * valid_f).sum(dim=1) / safe_edge    # (B,)
 
-            if n_edge < 2 or n_tok < 2:
-                continue
+        g_target = n_tok / target_group_size
+        f_target = ((n_edge - n_tok + g_target) / safe_edge).clamp(min=1e-6)
+        N        = (1.0 / f_target)                                 # (B,)
+        # Guard N > 1 for the loss (images that can't form >1 group are dropped
+        # from the average via the `good` mask below, but clamp first so the
+        # elementwise loss never hits a divide-by-zero).
+        N_safe   = N.clamp(min=1.0 + 1e-4)
 
-            g_target = n_tok / target_group_size
-            f_target = max((n_edge - n_tok + g_target) / n_edge, 1e-6)
-            N        = 1.0 / f_target
+        per_image = load_balancing_loss(F_rate, G_rate, N_safe)    # (B,)
 
-            if N <= 1.0:
-                continue
+        good = (N > 1.0) & (n_edge >= 2) & (n_tok >= 2)            # (B,) bool
+        if good.any():
+            l_ratio = per_image[good].mean()
+        else:
+            l_ratio = h.new_zeros(())
 
-            # Only compute F_rate and G_rate over valid edges for this image
-            valid_b  = valid[b]                           # (E,) bool
-            F_rate   = hard[b, valid_b].detach().mean()
-            G_rate   = probs[b, valid_b].mean()
-
-            l_ratio_total = l_ratio_total + (N / (N - 1)) * (
-                (N - 1) * F_rate * G_rate + (1 - F_rate) * (1 - G_rate)
-            )
-            n_valid_images += 1
-
-        l_ratio = l_ratio_total / max(n_valid_images, 1)
         return hard, probs, l_ratio
 
 

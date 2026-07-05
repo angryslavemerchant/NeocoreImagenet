@@ -511,6 +511,26 @@ class LocalTransformerBlock2(nn.Module):
 # Boundary Router
 # ---------------------------------------------------------------------------
 
+def load_balancing_loss(
+    F_rate: torch.Tensor,   # hard boundary fraction (detached), scalar or (B,)
+    G_rate: torch.Tensor,   # mean soft boundary probability, scalar or (B,)
+    N: torch.Tensor,        # target compression factor 1 / F_target, scalar or (B,)
+) -> torch.Tensor:
+    """
+    H-Net's load-balancing loss (hnet/utils/train.py), i.e. what we have been
+    calling the ratio loss. Minimised when both the realised boundary fraction
+    F_rate and the mean soft probability G_rate sit at the target 1/N.
+
+        L = ( (1 - F)(1 - G) + F·G·(N - 1) ) · N / (N - 1)
+
+    Works elementwise, so it serves both the fixed-topology Stage 1 (scalar N)
+    and the per-image Stage 2 (N as a (B,) tensor). Caller ensures N > 1.
+    """
+    return (
+        (1 - F_rate) * (1 - G_rate) + F_rate * G_rate * (N - 1)
+    ) * N / (N - 1)
+
+
 def _build_edge_indices(grid_size: int) -> torch.Tensor:
     """
     Precompute all 4-connected adjacent token pairs for a grid_size×grid_size grid.
@@ -530,32 +550,64 @@ def _build_edge_indices(grid_size: int) -> torch.Tensor:
 
 class BoundaryRouter(nn.Module):
     """
-    Scores every adjacent token pair and decides where group boundaries fall.
+    Stage 1 router — H-Net RoutingModule (hnet/modules/dc.py) adapted to a fixed
+    2D grid edge set.
 
-    Per edge (i, j):
-      1. Project:  q_i = W_q · h_i,   k_j = W_k · h_j
-      2. Score:    D(i,j) = 1 − cosine_similarity(q_i, k_j)
-      3. Prob:     p(i,j) = sigmoid(linear(D(i,j)))
+    Per edge (i, j) on the grid:
+        q_i = q_proj(h_i),  k_j = k_proj(h_j)          (projections init to I)
+        p(i, j) = clamp( (1 - cos_sim(q_i, k_j)) / 2, 0, 1 )
 
-    Uses a Straight-Through Estimator (forward pass makes a hard 0/1
-    boundary decision, backward pass lets gradients flow through the soft
-    probability as if the hard threshold never happened, keeping the router
-    trainable despite the discrete decision).
+    A hard boundary is p > 0.5. Groups are formed downstream by connected
+    components over the non-boundary edges (in ASFNet.forward), then mean-pooled
+    by GroupMerge. The hard decisions are detached before connected components
+    (that step is non-differentiable); the router's learnable signal is the
+    load-balancing loss on the soft probabilities, and its placement tracks the
+    encoder representations through the cosine similarity.
 
-    The ratio loss prevents the router collapsing to all-boundaries or
-    one-giant-group. Its target boundary fraction is derived from the actual
-    grid topology rather than a fixed fraction so it works correctly across
-    different patch sizes — see the comment in forward() for the derivation.
+    Faithful to H-Net (changed from the old router):
+      1. PARAMETER-FREE boundary probability p = clamp((1 - cos_sim)/2, 0, 1).
+         The old learned score_to_prob + sigmoid is gone: its slope could sharpen
+         without bound and flip many boundary decisions per unit representation
+         change, skating the boundary fraction across the percolation threshold
+         (the late-training group thrash). A fixed-slope map cannot sharpen.
+      2. q/k projections are full d_model -> d_model, INITIALISED TO IDENTITY,
+         so at init the boundary signal is the cosine similarity of the raw
+         encoder representations — meaningful from step 0 — rather than a random
+         low-dim shadow that must be unlearned.
+      3. cos_sim is clamped to [-1, 1] before the map (bf16 can drift outside).
+
+    2D deviations from H-Net (kept by design):
+      - Borders are found on EDGES + connected components, not per-token sequence
+        boundaries + discrete ChunkLayer selection.
+      - Chunks are MEAN-POOLED (GroupMerge), not represented by a selected token.
+      - No DeChunkLayer / smoothing (this is a classifier; it never upsamples),
+        so placement gets its task signal via the encoder representations plus
+        the load-balancing loss rather than a dechunk-confidence path.
+      - No forced first-token boundary (no sequence start in 2D); the giant-
+        component failure mode is handled by the percolation-aware target below.
+
+    proj_dim is accepted for backward compatibility with existing construction
+    calls but is IGNORED — projections are always full d_model, per H-Net.
     """
 
-    def __init__(self, d_model: int, proj_dim: int = 64, grid_size: int = 14):
+    def __init__(self, d_model: int, proj_dim: int = None, grid_size: int = 14):
         super().__init__()
-        self.W_q           = nn.Linear(d_model, proj_dim, bias=False)
-        self.W_k           = nn.Linear(d_model, proj_dim, bias=False)
-        self.score_to_prob = nn.Linear(1, 1)
+        self.d_model = d_model
+
+        # Identity-initialised projections (H-Net RoutingModule).
+        self.q_proj = nn.Linear(d_model, d_model, bias=False)
+        self.k_proj = nn.Linear(d_model, d_model, bias=False)
+        with torch.no_grad():
+            self.q_proj.weight.copy_(torch.eye(d_model))
+            self.k_proj.weight.copy_(torch.eye(d_model))
+        # Guard against any global weight-reinit scheme clobbering the identity.
+        self.q_proj.weight._no_reinit = True
+        self.k_proj.weight._no_reinit = True
 
         edges = _build_edge_indices(grid_size)
         self.register_buffer("edge_indices", edges)
+        self.n_tokens = grid_size * grid_size
+        self.n_edges  = edges.shape[0]
 
     def forward(
         self,
@@ -567,63 +619,41 @@ class BoundaryRouter(nn.Module):
         target_group_size: desired average tokens per group
 
         Returns:
-            hard:    (B, E) binary boundary decisions with Straight-Through gradient
+            hard:    (B, E) binary boundary decisions (caller detaches for CC)
             probs:   (B, E) soft boundary probabilities
-            l_ratio: scalar ratio loss
+            l_ratio: scalar load-balancing loss
         """
         idx_i = self.edge_indices[:, 0]
         idx_j = self.edge_indices[:, 1]
 
-        q = self.W_q(h)
-        k = self.W_k(h)
+        q = self.q_proj(h)
+        k = self.k_proj(h)
 
         q_i = q[:, idx_i, :]
         k_j = k[:, idx_j, :]
 
-        sim   = F.cosine_similarity(q_i, k_j, dim=-1)
-        D     = (1.0 - sim).unsqueeze(-1)
-        probs = torch.sigmoid(self.score_to_prob(D)).squeeze(-1)
+        cos   = F.cosine_similarity(q_i, k_j, dim=-1).clamp(-1.0, 1.0)
+        probs = ((1.0 - cos) / 2.0).clamp(0.0, 1.0)          # (B, E)
+        hard  = (probs > 0.5).float()                         # (B, E)
 
-        hard = (probs > 0.5).float() + probs - probs.detach()
-
-        # --- Ratio loss ---
+        # --- Target from grid topology (spanning-forest), fed into H-Net loss ---
         #
-        # The original formulation used N = target_group_size directly,
-        # targeting F = 1/N of edges as boundaries. This breaks on different
-        # patch sizes because the same boundary fraction produces different
-        # group counts depending on how many edges the grid has relative to
-        # its token count.
-        #
-        # Fix: derive target boundary fraction from actual grid topology.
-        #
-        # Spanning forest argument: a forest with G trees on T nodes needs
-        # exactly T-G internal (non-boundary) edges. Everything else is a
-        # boundary. So:
-        #
+        # A forest with G trees on T nodes has exactly T-G internal (non-boundary)
+        # edges; everything else is a boundary. So the target boundary fraction is
         #   F_target = (n_edges - n_tokens + G_target) / n_edges
         #   G_target = n_tokens / target_group_size
-        #
-        # This gives F_target ≈ 0.64 for both 14×14 and 28×28 grids.
-        # Critically, this is above 0.5 — the percolation threshold (the
-        # point below which a giant connected component forms and swallows
-        # most tokens into a few huge groups). The original N=3 targeted
-        # F=0.33, well below this threshold, which is why 8×8 patches
-        # collapsed to ~100 groups instead of ~261.
-        n_tokens = h.shape[1]
-        n_edges  = self.edge_indices.shape[0]
+        # giving F_target ≈ 0.64 on the 14×14 grid — above the ~0.5 percolation
+        # threshold, so no giant component forms. N = 1 / F_target is the
+        # effective compression factor handed to the H-Net load-balancing loss.
+        n_tokens = self.n_tokens
+        n_edges  = self.n_edges
         g_target = n_tokens / target_group_size
-        f_target = (n_edges - n_tokens + g_target) / n_edges
-        f_target = max(f_target, 1e-6)
+        f_target = max((n_edges - n_tokens + g_target) / n_edges, 1e-6)
         N        = 1.0 / f_target
 
-        F_rate = hard.detach().mean(dim=-1)
-        G_rate = probs.mean(dim=-1)
-
-        l_ratio = (N / (N - 1)) * (
-            (N - 1) * F_rate * G_rate
-            + (1 - F_rate) * (1 - G_rate)
-        )
-        l_ratio = l_ratio.mean()
+        F_rate  = hard.detach().mean()
+        G_rate  = probs.mean()
+        l_ratio = load_balancing_loss(F_rate, G_rate, N)
 
         return hard, probs, l_ratio
 
