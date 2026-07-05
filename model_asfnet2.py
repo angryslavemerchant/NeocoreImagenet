@@ -9,12 +9,24 @@ Applies grouping twice in sequence:
   Example (4.0, 2.0):  196 → ~49 → ~25  (1/8 overall compression)
 
 Shared components (PatchEmbed, Attention, TransformerBlock, BoundaryRouter,
-GroupMerge, gpu_connected_components) are imported directly from model_asfnet
-to avoid duplication. New code here covers only Stage 2-specific pieces:
+GroupMerge, gpu_connected_components, and the local-attention blocks) are
+imported directly from model_asfnet to avoid duplication. New code here covers
+only Stage 2-specific pieces:
   - build_knn_edges
+  - knn_edges_to_mask
   - gpu_connected_components_dynamic
   - BoundaryRouter2
   - ASFNet2
+
+Local attention (optional, off by default):
+  - local_encoder1 : Stage 1 encoder uses a fixed grid-window mask
+                     (LocalTransformerBlock, radius = local_radius).
+  - local_encoder2 : Stage 2 encoder uses the per-image k-NN adjacency as its
+                     attention mask (LocalTransformerBlock2). The same k-NN
+                     edges are reused by BoundaryRouter2, so the encoder mixes
+                     tokens over exactly the graph the router then cuts.
+  The four combinations of these two flags give the global/global,
+  local/global, global/local, local/local ablation grid.
 """
 
 import torch
@@ -101,6 +113,54 @@ def build_knn_edges(
     valid    = src_real & dst_real        # (B, G*k)
 
     return src, dst, valid
+
+
+# ---------------------------------------------------------------------------
+# Stage 2 local-attention mask — dense adjacency from the k-NN edge lists
+# ---------------------------------------------------------------------------
+
+def knn_edges_to_mask(
+    src:      torch.Tensor,   # (B, E) source token index per edge
+    dst:      torch.Tensor,   # (B, E) destination token index per edge
+    valid:    torch.Tensor,   # (B, E) True = real edge (not involving padding)
+    n_tokens: int,            # G = max_G1, tokens per image (incl. padding)
+) -> torch.Tensor:
+    """
+    Convert the per-image k-NN edge lists from build_knn_edges into a dense
+    (B, G, G) boolean attention mask for Stage 2 local attention.
+
+    mask[b, i, j] = True means query token i may attend to key token j.
+    Set True for every valid edge (i = src, j = dst). Self-loops are added on
+    the diagonal so that:
+      - every real token attends to itself plus its k nearest real neighbours;
+      - every padding token attends only to itself, which keeps its query row
+        non-empty (an all-False row would make scaled_dot_product_attention
+        produce NaN). The padding token's output is discarded downstream.
+
+    Because padding destinations are already excluded from the edge lists
+    (INF distance in build_knn_edges) and padding-source edges are marked
+    invalid, no real token ever has a padding token as a key. So this single
+    mask fully replaces the separate padding mask the global encoder2 used.
+
+    The mask is built from the SAME edges later passed to BoundaryRouter2, so
+    the encoder mixes tokens over exactly the graph the router then cuts.
+    """
+    B, E   = src.shape
+    device = src.device
+    G      = n_tokens
+
+    mask = torch.zeros(B, G, G, dtype=torch.bool, device=device)
+
+    bb  = torch.arange(B, device=device).view(B, 1).expand(B, E)  # (B, E)
+    sel = valid                                                   # (B, E) bool
+    # Flatten only the valid edges into 1D index tensors and set them True.
+    mask[bb[sel], src[sel], dst[sel]] = True
+
+    # Self-loops (prevents all-False rows → NaN; gives real tokens self-access).
+    diag = torch.arange(G, device=device)
+    mask[:, diag, diag] = True
+
+    return mask
 
 
 # ---------------------------------------------------------------------------
@@ -307,6 +367,13 @@ class ASFNet2(nn.Module):
         → masked Global Average Pool
         → Linear classifier
 
+    Local attention (optional):
+      local_encoder1 swaps the Stage 1 encoder for grid-window local blocks
+      (radius local_radius). local_encoder2 swaps the Stage 2 encoder for
+      k-NN-masked local blocks; the k-NN adjacency is built once before the
+      encoder and reused by BoundaryRouter2. Both default off, giving the plain
+      global/global model unless enabled.
+
     Why k-NN for Stage 2 and not for Stage 1?
     At Stage 1 every token is exactly one patch, so the true spatial
     adjacency IS the regular grid — k-NN on integer grid coordinates
@@ -340,6 +407,7 @@ class ASFNet2(nn.Module):
         knn_k:                int   = 6,
         local_encoder1: bool = False,
         local_radius: int = 1,
+        local_encoder2: bool = False,
     ):
         super().__init__()
         self.target_group_size_1 = target_group_size_1
@@ -365,10 +433,17 @@ class ASFNet2(nn.Module):
         self.router1  = BoundaryRouter(d_model, router_proj_dim, grid_size)
         self.merge1   = GroupMerge(d_model)
 
-        self.encoder2 = nn.ModuleList([
-            TransformerBlock(d_model, num_heads, mlp_ratio)
-            for _ in range(encoder2_blocks)
-        ])
+        self.local_encoder2 = local_encoder2
+        if local_encoder2:
+            self.encoder2 = nn.ModuleList([
+                LocalTransformerBlock2(d_model, num_heads, mlp_ratio)
+                for _ in range(encoder2_blocks)
+            ])
+        else:
+            self.encoder2 = nn.ModuleList([
+                TransformerBlock(d_model, num_heads, mlp_ratio)
+                for _ in range(encoder2_blocks)
+            ])
 
         # Stage 2: dynamic k-NN router, no grid_size needed
         self.router2  = BoundaryRouter2(d_model, router_proj_dim)
@@ -415,22 +490,32 @@ class ASFNet2(nn.Module):
             tokens, coords, group_ids1
         )
 
-        # ---- Stage 2 ----
-        for block in self.encoder2:
-            padded_tokens1 = block(padded_tokens1, padded_coords1, pad_mask1)
-
-        # Real token count per image going into Stage 2 routing.
-        # Needed for the per-image ratio loss formula.
-        n_real1 = (~pad_mask1).sum(dim=1)   # (B,)
-
+        # ---- Stage 2 adjacency ----
+        # k-NN depends only on Stage 1 centroids + padding, NOT on encoder2
+        # output, so build it once up front and reuse it for both the encoder2
+        # local-attention mask and the router. (Reordering vs. the original is
+        # behaviour-identical in the global-encoder2 case.)
+        n_real1 = (~pad_mask1).sum(dim=1)   # (B,) real token count per image
         src2, dst2, valid2 = build_knn_edges(padded_coords1, pad_mask1, self.knn_k)
+        max_G1 = padded_tokens1.shape[1]
 
+        # ---- Stage 2 encoder ----
+        if self.local_encoder2:
+            # Attention restricted to the k-NN neighbourhood (self-loops added).
+            # This mask already excludes padding keys, so no separate pad mask.
+            adj2 = knn_edges_to_mask(src2, dst2, valid2, max_G1)   # (B, G1, G1) bool
+            for block in self.encoder2:
+                padded_tokens1 = block(padded_tokens1, padded_coords1, adj2)
+        else:
+            for block in self.encoder2:
+                padded_tokens1 = block(padded_tokens1, padded_coords1, pad_mask1)
+
+        # ---- Stage 2 routing ----
         hard2, _, l_ratio2 = self.router2(
             padded_tokens1, src2, dst2, valid2,
             self.target_group_size_2, n_real1,
         )
 
-        max_G1     = padded_tokens1.shape[1]
         group_ids2 = gpu_connected_components_dynamic(
             hard2.detach(), valid2, src2, dst2, max_G1
         )
@@ -493,4 +578,3 @@ class ASFNet2(nn.Module):
             "norm+head":    n(self.norm) + n(self.classifier),
             "total":        n(self),
         }
-

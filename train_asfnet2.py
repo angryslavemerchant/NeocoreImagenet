@@ -40,6 +40,7 @@ def build_model(args) -> ASFNet2:
         knn_k                = args.knn_k,
         local_encoder1       = args.local_encoder1,
         local_radius         = args.local_radius,
+        local_encoder2       = args.local_encoder2,
     )
 
 
@@ -211,6 +212,9 @@ def main():
                         help="Use local-neighbourhood attention in encoder1")
     parser.add_argument("--local_radius", type=int, default=1,
                         help="Chebyshev radius of the encoder1 attention window")
+    parser.add_argument("--local_encoder2", action="store_true",
+                        help="Use k-NN local attention in encoder2 (mask = the same "
+                             "per-image k-NN graph the Stage 2 router cuts)")
 
     # --- Training ---
     parser.add_argument("--batch_size",          type=int,   default=1024)
@@ -255,8 +259,9 @@ def main():
     if args.run_name is None:
         args.run_name = (
             f"ASFNet2_D{args.d_model}"
-            f"_enc{args.local_encoder1}-{args.local_radius}"
-            f"_loc{args.encoder1_blocks}-{args.encoder2_blocks}"
+            f"_loc{args.local_encoder1}-{args.local_radius}"
+            f"_l2{args.local_encoder2}"
+            f"_enc{args.encoder1_blocks}-{args.encoder2_blocks}"
             f"_main{args.main_blocks}"
             f"_N{args.target_group_size_1}-{args.target_group_size_2}"
             f"_k{args.knn_k}_p{args.patch_size}"
@@ -272,7 +277,7 @@ def main():
     train_loader, val_loader = get_dataloaders(args)
 
     model = build_model(args).to(device)
-    #model = torch.compile(model)
+    model = torch.compile(model)
 
     param_counts = model.count_parameters()
     print("\nParameter counts:")

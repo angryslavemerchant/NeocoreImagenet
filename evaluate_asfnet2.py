@@ -33,6 +33,7 @@ from dataset import get_dataloaders, IMAGENET_MEAN, IMAGENET_STD
 from model_asfnet2 import (
     ASFNet2,
     build_knn_edges,
+    knn_edges_to_mask,
     gpu_connected_components_dynamic,
 )
 from model_asfnet import gpu_connected_components
@@ -64,6 +65,7 @@ def _load_model(path: str, device: torch.device) -> tuple[ASFNet2, dict]:
         knn_k               = a["knn_k"],
         local_encoder1      = a.get("local_encoder1", False),
         local_radius        = a.get("local_radius", 1),
+        local_encoder2      = a.get("local_encoder2", False),
     )
     model.load_state_dict(ckpt["model"])
     model.to(device).eval()
@@ -116,15 +118,25 @@ def _get_intermediate(
         )
 
         # ---- Stage 2 ----
-        for block in model.encoder2:
-            padded_tokens1 = block(padded_tokens1, padded_coords1, pad_mask1)
-
+        # k-NN adjacency depends only on Stage 1 centroids + padding, so build it
+        # before encoder2 and reuse it for both the local-attention mask and the
+        # router (mirrors ASFNet2.forward). Reordering is behaviour-identical in
+        # the global-encoder2 case.
         n_real1       = (~pad_mask1).sum(dim=1)
         src2, dst2, valid2 = build_knn_edges(padded_coords1, pad_mask1, model.knn_k)
+        max_G1        = padded_tokens1.shape[1]
+
+        if model.local_encoder2:
+            adj2 = knn_edges_to_mask(src2, dst2, valid2, max_G1)
+            for block in model.encoder2:
+                padded_tokens1 = block(padded_tokens1, padded_coords1, adj2)
+        else:
+            for block in model.encoder2:
+                padded_tokens1 = block(padded_tokens1, padded_coords1, pad_mask1)
+
         hard2, _, _   = model.router2(
             padded_tokens1, src2, dst2, valid2, model.target_group_size_2, n_real1
         )
-        max_G1        = padded_tokens1.shape[1]
         group_ids2    = gpu_connected_components_dynamic(
             hard2.detach(), valid2, src2, dst2, max_G1
         )
