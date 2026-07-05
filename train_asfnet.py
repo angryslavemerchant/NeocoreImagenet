@@ -56,16 +56,16 @@ def save_checkpoint(state: dict, path: str):
 
 
 def load_checkpoint(path: str, model: nn.Module, optimizer, scaler, device):
-    # args stored as plain dict (not a dataclass), so weights_only=True is safe
     ckpt = torch.load(path, map_location=device, weights_only=True)
     model.load_state_dict(ckpt["model"])
     optimizer.load_state_dict(ckpt["optimizer"])
     if "scaler" in ckpt:
         scaler.load_state_dict(ckpt["scaler"])
-    start_epoch = ckpt["epoch"] + 1
-    best_top1   = ckpt.get("best_top1", 0.0)
+    start_epoch    = ckpt["epoch"] + 1
+    best_top1      = ckpt.get("best_top1", 0.0)
+    images_seen    = ckpt.get("images_seen", 0)
     print(f"Resumed from epoch {start_epoch}  (best top-1 so far: {best_top1:.2f}%)")
-    return start_epoch, best_top1
+    return start_epoch, best_top1, images_seen
 
 
 # ---------------------------------------------------------------------------
@@ -73,15 +73,22 @@ def load_checkpoint(path: str, model: nn.Module, optimizer, scaler, device):
 # ---------------------------------------------------------------------------
 
 def train_one_epoch(
-    model:       nn.Module,
+    model:            nn.Module,
     loader,
     optimizer,
-    scaler:      GradScaler,
+    scaler:           GradScaler,
     args,
-    epoch:       int,
-    device:      torch.device,
-    global_step: int,
-) -> tuple[float, float, float, int]:
+    epoch:            int,
+    device:           torch.device,
+    global_step:      int,
+    images_seen:      int,   # cumulative images processed across all epochs so far
+) -> tuple[float, float, float, int, int]:
+    """
+    Returns: (loss, top1, top5, global_step, images_seen)
+    images_seen is returned so main() can persist it across epochs and
+    checkpoints, keeping log timing consistent with image count rather
+    than step count regardless of batch size.
+    """
     model.train()
 
     losses       = AverageMeter()
@@ -124,7 +131,13 @@ def train_one_epoch(
             groups = f"{group_counts.avg:.1f}",
         )
 
-        if global_step % args.log_interval == 0:
+        # Log every log_interval IMAGES, not steps.
+        # This keeps logging frequency consistent across runs with different
+        # batch sizes — critical when comparing 8×8 patch runs (small batch)
+        # against 16×16 runs (large batch).
+        prev_images  = images_seen
+        images_seen += B
+        if images_seen // args.log_interval != prev_images // args.log_interval:
             wandb.log({
                 "train/loss":        losses.avg,
                 "train/task_loss":   task_losses.avg,
@@ -133,11 +146,12 @@ def train_one_epoch(
                 "train/top5":        top5.avg,
                 "train/mean_groups": group_counts.avg,
                 "train/grad_scale":  scaler.get_scale(),
+                "train/images_seen": images_seen,
             }, step=global_step)
 
         global_step += 1
 
-    return losses.avg, top1.avg, top5.avg, global_step
+    return losses.avg, top1.avg, top5.avg, global_step, images_seen
 
 
 @torch.no_grad()
@@ -193,26 +207,16 @@ def main():
     parser = argparse.ArgumentParser(description="Train ASFNet")
 
     # --- Model architecture ---
-    parser.add_argument("--image_size",        type=int,   default=224,
-                        help="Input image size (assumed square)")
-    parser.add_argument("--patch_size",        type=int,   default=16,
-                        help="Patch token size in pixels")
-    parser.add_argument("--d_model",           type=int,   default=256,
-                        help="Transformer model dimension")
-    parser.add_argument("--num_heads",         type=int,   default=8,
-                        help="Attention heads (d_model must be divisible by this)")
-    parser.add_argument("--encoder_blocks",    type=int,   default=2,
-                        help="Transformer blocks before the router")
-    parser.add_argument("--main_blocks",       type=int,   default=6,
-                        help="Transformer blocks after group merging")
-    parser.add_argument("--mlp_ratio",         type=float, default=3.0,
-                        help="FFN hidden dim = d_model * mlp_ratio")
-    parser.add_argument("--num_classes",       type=int,   default=100,
-                        help="Number of output classes")
-    parser.add_argument("--target_group_size", type=float, default=3.0,
-                        help="Target average patches per group (N in ratio loss)")
-    parser.add_argument("--router_proj_dim",   type=int,   default=64,
-                        help="Projection dim for router W_q and W_k")
+    parser.add_argument("--image_size",        type=int,   default=224)
+    parser.add_argument("--patch_size",        type=int,   default=16)
+    parser.add_argument("--d_model",           type=int,   default=256)
+    parser.add_argument("--num_heads",         type=int,   default=8)
+    parser.add_argument("--encoder_blocks",    type=int,   default=2)
+    parser.add_argument("--main_blocks",       type=int,   default=6)
+    parser.add_argument("--mlp_ratio",         type=float, default=3.0)
+    parser.add_argument("--num_classes",       type=int,   default=100)
+    parser.add_argument("--target_group_size", type=float, default=3.0)
+    parser.add_argument("--router_proj_dim",   type=int,   default=64)
 
     # --- Training ---
     parser.add_argument("--batch_size",        type=int,   default=1024)
@@ -221,10 +225,9 @@ def main():
     parser.add_argument("--weight_decay",      type=float, default=0.05)
     parser.add_argument("--grad_clip",         type=float, default=1.0)
     parser.add_argument("--warmup_epochs",     type=int,   default=10)
-    parser.add_argument("--ratio_loss_weight", type=float, default=0.03,
-                        help="Weight on L_ratio (0.03 from H-Net)")
+    parser.add_argument("--ratio_loss_weight", type=float, default=0.03)
 
-    # --- Data (attribute names must match what dataset.py expects on a config object) ---
+    # --- Data ---
     parser.add_argument("--dataset_name",      type=str, default="clane9/imagenet-100")
     parser.add_argument("--dataset_cache_dir", type=str, default="./data")
     parser.add_argument("--jpeg_cache_dir",    type=str, default="./jpeg_cache")
@@ -232,14 +235,13 @@ def main():
 
     # --- Infrastructure ---
     parser.add_argument("--checkpoint_dir", type=str, default="./checkpoints_asfnet")
-    parser.add_argument("--resume",         type=str, default=None,
-                        help="Path to checkpoint to resume from")
+    parser.add_argument("--resume",         type=str, default=None)
     parser.add_argument("--wandb_project",  type=str, default="asfnet")
     parser.add_argument("--wandb_entity",   type=str, default=None)
-    parser.add_argument("--run_name",       type=str, default=None,
-                        help="wandb run name; auto-generated from key args if omitted")
-    parser.add_argument("--log_interval",   type=int, default=50,
-                        help="Log to wandb every N optimizer steps")
+    parser.add_argument("--run_name",       type=str, default=None)
+    parser.add_argument("--log_interval",   type=int, default=10000,
+                        help="Log to wandb every N images processed (not steps). "
+                             "Keeps log density consistent across different batch sizes.")
     parser.add_argument("--seed",           type=int, default=42)
     parser.add_argument("--device",         type=str, default="cuda")
 
@@ -248,11 +250,10 @@ def main():
     set_seed(args.seed)
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
 
-    # Auto-generate a descriptive run name from key hyperparams
     if args.run_name is None:
         args.run_name = (
             f"D{args.d_model}_enc{args.encoder_blocks}_main{args.main_blocks}"
-            f"_N{args.target_group_size}_mlp{args.mlp_ratio}"
+            f"_N{args.target_group_size}_mlp{args.mlp_ratio}_p{args.patch_size}"
         )
 
     wandb.init(
@@ -262,12 +263,8 @@ def main():
         config  = vars(args),
     )
 
-    # get_dataloaders expects attribute access on a config-like object.
-    # argparse Namespace provides the same interface as the old Config dataclass,
-    # so no changes to dataset.py are needed.
     train_loader, val_loader = get_dataloaders(args)
 
-    # Model
     model = build_model(args).to(device)
     param_counts = model.count_parameters()
     print("\nParameter counts:")
@@ -275,7 +272,6 @@ def main():
         print(f"  {name:<16} {count:>10,}")
     wandb.config.update({"param_counts": param_counts})
 
-    # Optimizer: AdamW with cosine annealing and linear warmup
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr           = args.lr,
@@ -298,29 +294,28 @@ def main():
         milestones = [args.warmup_epochs],
     )
 
-    # bfloat16 has float32-range exponents so loss scaling rarely triggers,
-    # but keeping GradScaler handles edge cases gracefully
-    scaler = GradScaler()
-
-    # Resume
+    scaler      = GradScaler()
     start_epoch = 0
     best_top1   = 0.0
     global_step = 0
+    images_seen = 0   # cumulative across all epochs, persisted in checkpoints
 
     if args.resume:
-        start_epoch, best_top1 = load_checkpoint(
+        start_epoch, best_top1, images_seen = load_checkpoint(
             args.resume, model, optimizer, scaler, device
         )
 
     print(f"\nTraining '{args.run_name}' on {device}")
-    print(f"Epochs: {args.num_epochs}  |  Batch: {args.batch_size}  |  LR: {args.lr}\n")
+    print(f"Epochs: {args.num_epochs}  |  Batch: {args.batch_size}  |  LR: {args.lr}")
+    print(f"Logging every {args.log_interval:,} images\n")
 
     for epoch in range(start_epoch, args.num_epochs):
         current_lr = optimizer.param_groups[0]["lr"]
         wandb.log({"train/lr": current_lr}, step=global_step)
 
-        train_loss, train_top1, train_top5, global_step = train_one_epoch(
-            model, train_loader, optimizer, scaler, args, epoch, device, global_step
+        train_loss, train_top1, train_top5, global_step, images_seen = train_one_epoch(
+            model, train_loader, optimizer, scaler, args, epoch, device,
+            global_step, images_seen,
         )
         val_loss, val_top1, val_top5 = validate(
             model, val_loader, args, epoch, device, global_step
@@ -334,23 +329,22 @@ def main():
             f"val loss {val_loss:.3f} top1 {val_top1:.1f}% top5 {val_top5:.1f}%"
         )
 
-        # Store args as plain dict — safe to load with weights_only=True
-        # (unlike the old Config dataclass which required weights_only=False)
         ckpt = {
-            "epoch":     epoch,
-            "model":     model.state_dict(),
-            "optimizer": optimizer.state_dict(),
-            "scaler":    scaler.state_dict(),
-            "val_top1":  val_top1,
-            "best_top1": best_top1,
-            "args":      vars(args),
+            "epoch":       epoch,
+            "model":       model.state_dict(),
+            "optimizer":   optimizer.state_dict(),
+            "scaler":      scaler.state_dict(),
+            "val_top1":    val_top1,
+            "best_top1":   best_top1,
+            "images_seen": images_seen,   # saved so resume keeps log timing correct
+            "args":        vars(args),
         }
 
         save_checkpoint(ckpt, os.path.join(args.checkpoint_dir, "latest.pt"))
 
         if val_top1 > best_top1:
-            best_top1          = val_top1
-            ckpt["best_top1"]  = best_top1
+            best_top1         = val_top1
+            ckpt["best_top1"] = best_top1
             save_checkpoint(ckpt, os.path.join(args.checkpoint_dir, "best.pt"))
             print(f"  *** New best: {best_top1:.2f}%")
 

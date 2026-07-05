@@ -1,3 +1,4 @@
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -10,11 +11,12 @@ from typing import Optional
 
 class PatchEmbed(nn.Module):
     """
-    Splits a 224×224 image into non-overlapping 16×16 patches and linearly
+    Splits a 224×224 image into non-overlapping patches and linearly
     projects each to d_model dimensions.
 
-    Produces a 14×14 = 196 token sequence with fixed (row, col) grid coordinates.
-    Coordinates are registered as a buffer so they follow the model to whatever device.
+    Produces a grid_size×grid_size token sequence with fixed (row, col) grid
+    coordinates. Coordinates are registered as a buffer so they follow the
+    model to whatever device.
     """
 
     def __init__(
@@ -25,15 +27,12 @@ class PatchEmbed(nn.Module):
         d_model:     int = 256,
     ):
         super().__init__()
-        self.grid_size = image_size // patch_size  # 14
-        self.n_patches = self.grid_size ** 2       # 196
+        self.grid_size = image_size // patch_size
+        self.n_patches = self.grid_size ** 2
 
-        # Conv2d with kernel=stride=patch_size tiles the image without overlap —
-        # equivalent to flatten-then-linear but faster
         self.proj = nn.Conv2d(in_channels, d_model, kernel_size=patch_size, stride=patch_size)
         self.norm = nn.LayerNorm(d_model)
 
-        # Precompute integer (row, col) grid coordinates once; shape (196, 2)
         rows = torch.arange(self.grid_size).float()
         cols = torch.arange(self.grid_size).float()
         grid_row, grid_col = torch.meshgrid(rows, cols, indexing="ij")
@@ -41,11 +40,10 @@ class PatchEmbed(nn.Module):
         self.register_buffer("coords", coords)
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        # x: (B, C, H, W)
         x = self.proj(x)                    # (B, D, grid, grid)
-        x = x.flatten(2).transpose(1, 2)   # (B, 196, D)
+        x = x.flatten(2).transpose(1, 2)   # (B, N, D)
         x = self.norm(x)
-        return x, self.coords               # tokens: (B, 196, D),  coords: (196, 2)
+        return x, self.coords               # tokens: (B, N, D),  coords: (N, 2)
 
 
 # ---------------------------------------------------------------------------
@@ -57,9 +55,12 @@ def _build_rope_2d(
     head_dim: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    Compute per-position rotation factors for 2D RoPE (Rotary Positional Encoding —
-    encodes position by rotating token vectors in embedding space rather than adding
-    a lookup table, which preserves relative distance information across any sequence length).
+    Compute per-position rotation factors for 2D Rotary Positional Encoding.
+
+    Rotary Positional Encoding encodes position by rotating token vectors in
+    embedding space rather than adding a fixed lookup table. This preserves
+    relative distance information and works naturally with fractional
+    coordinates (which appear after group merging).
 
     The head dimension is split in two halves:
       dims [0 : head_dim//2]  encode row position
@@ -71,39 +72,35 @@ def _build_rope_2d(
     Returns cos, sin of shape (..., head_dim).
     """
     assert head_dim % 4 == 0, "head_dim must be divisible by 4 for 2D RoPE"
-    half    = head_dim // 2   # dims allocated per spatial axis
-    n_freqs = half // 2       # frequency pairs per axis
+    half    = head_dim // 2
+    n_freqs = half // 2
 
     device = coords.device
 
-    # Geometric sequence of inverse frequencies: θ_i = 1 / 10000^(i / n_freqs)
     freqs = 1.0 / (
         10000 ** (torch.arange(n_freqs, device=device).float() / n_freqs)
     )
 
-    row = coords[..., 0]   # (...)
+    row = coords[..., 0]
     col = coords[..., 1]
 
-    # (..., n_freqs) via broadcasting
     row_angles = row.unsqueeze(-1) * freqs
     col_angles = col.unsqueeze(-1) * freqs
 
-    # repeat_interleave so adjacent dim pairs share one angle,
-    # matching the _rotate_half pairing below
-    row_cos = torch.cos(row_angles).repeat_interleave(2, dim=-1)  # (..., half)
+    row_cos = torch.cos(row_angles).repeat_interleave(2, dim=-1)
     row_sin = torch.sin(row_angles).repeat_interleave(2, dim=-1)
     col_cos = torch.cos(col_angles).repeat_interleave(2, dim=-1)
     col_sin = torch.sin(col_angles).repeat_interleave(2, dim=-1)
 
-    cos = torch.cat([row_cos, col_cos], dim=-1)  # (..., head_dim)
+    cos = torch.cat([row_cos, col_cos], dim=-1)
     sin = torch.cat([row_sin, col_sin], dim=-1)
     return cos, sin
 
 
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:
     """Rotate adjacent dimension pairs: [x0, x1, x2, x3] → [−x1, x0, −x3, x2]."""
-    x1 = x[..., 0::2]  # even dims
-    x2 = x[..., 1::2]  # odd dims
+    x1 = x[..., 0::2]
+    x2 = x[..., 1::2]
     return torch.stack([-x2, x1], dim=-1).flatten(-2)
 
 
@@ -114,25 +111,21 @@ def apply_rope_2d(
     head_dim: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    Apply 2D RoPE rotations to query and key tensors.
+    Apply 2D Rotary Positional Encoding rotations to query and key tensors.
 
     q, k:   (B, num_heads, N, head_dim)
     coords: (N, 2)    shared across batch — used in encoder (integer patch coords)
          or (B, N, 2) per-image — used in main network (fractional group centroid coords)
-
-    Casts rotation factors to match q/k dtype (important for bfloat16 training).
     """
-    cos, sin = _build_rope_2d(coords, head_dim)  # (N, D) or (B, N, D)
+    cos, sin = _build_rope_2d(coords, head_dim)
 
-    # Broadcast over batch and head dims
     if cos.dim() == 2:
-        cos = cos[None, None]   # (1, 1, N, D)
+        cos = cos[None, None]
         sin = sin[None, None]
     else:
-        cos = cos.unsqueeze(1)  # (B, 1, N, D)
+        cos = cos.unsqueeze(1)
         sin = sin.unsqueeze(1)
 
-    # Cast to match the compute dtype (e.g. bfloat16 under autocast)
     cos = cos.to(q.dtype)
     sin = sin.to(q.dtype)
 
@@ -147,12 +140,8 @@ def apply_rope_2d(
 
 class Attention(nn.Module):
     """
-    Multi-head self-attention where 2D RoPE is applied directly to queries and keys.
-
-    Positional information is encoded as relative rotations between q and k,
-    not as additive embeddings on input tokens. This means position-encoding
-    is always relative — a useful property after adaptive group merging where
-    group centroid coordinates can be fractional and non-uniform.
+    Multi-head self-attention where 2D Rotary Positional Encoding is applied
+    directly to queries and keys.
 
     Uses F.scaled_dot_product_attention which dispatches to FlashAttention
     when available.
@@ -173,33 +162,25 @@ class Attention(nn.Module):
         coords: torch.Tensor,
         attn_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """
-        x:         (B, N, D)
-        coords:    (N, 2) or (B, N, 2)
-        attn_mask: (B, N) bool — True marks padding tokens to be ignored in attention
-        """
         B, N, D = x.shape
 
-        qkv = self.qkv(x)               # (B, N, 3D)
+        qkv = self.qkv(x)
         q, k, v = qkv.chunk(3, dim=-1)
 
         def to_heads(t: torch.Tensor) -> torch.Tensor:
             return t.view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
 
-        q, k, v = to_heads(q), to_heads(k), to_heads(v)  # (B, heads, N, head_dim)
+        q, k, v = to_heads(q), to_heads(k), to_heads(v)
 
-        # Apply 2D RoPE rotations to queries and keys
         q, k = apply_rope_2d(q, k, coords, self.head_dim)
 
-        # Build additive float bias from boolean padding mask.
-        # Shape (B, 1, 1, N): adds -inf to padding key positions so they attract no attention.
         bias = None
         if attn_mask is not None:
             bias = torch.zeros(B, 1, 1, N, device=x.device, dtype=q.dtype)
             bias = bias.masked_fill(attn_mask[:, None, None, :], float("-inf"))
 
-        out = F.scaled_dot_product_attention(q, k, v, attn_mask=bias)  # (B, heads, N, head_dim)
-        out = out.transpose(1, 2).reshape(B, N, D)                     # merge heads
+        out = F.scaled_dot_product_attention(q, k, v, attn_mask=bias)
+        out = out.transpose(1, 2).reshape(B, N, D)
         return self.out(out)
 
 
@@ -209,14 +190,14 @@ class Attention(nn.Module):
 
 class TransformerBlock(nn.Module):
     """
-    Standard ViT (Vision Transformer) transformer block using pre-norm.
+    Standard Vision Transformer block using pre-norm.
 
-    Pre-norm means LayerNorm is applied before each sub-layer (not after),
-    which is more stable to train than post-norm at moderate depth.
+    Pre-norm means LayerNorm (Layer Normalization — a technique that
+    normalizes the activations within each token to have zero mean and
+    unit variance, stabilizing training) is applied before each sub-layer
+    rather than after.
 
-    Structure:  LN → Attention (with 2D RoPE) → residual → LN → FFN → residual
-
-    The same block definition is reused in both the encoder and the main network.
+    Structure: LN → Attention → residual → LN → FFN → residual
     """
 
     def __init__(self, d_model: int, num_heads: int, mlp_ratio: float = 3.0):
@@ -258,10 +239,10 @@ def _build_edge_indices(grid_size: int) -> torch.Tensor:
         for c in range(grid_size):
             idx = r * grid_size + c
             if c + 1 < grid_size:
-                edges.append((idx, idx + 1))           # right
+                edges.append((idx, idx + 1))
             if r + 1 < grid_size:
-                edges.append((idx, idx + grid_size))   # down
-    return torch.tensor(edges, dtype=torch.long)        # (E, 2)
+                edges.append((idx, idx + grid_size))
+    return torch.tensor(edges, dtype=torch.long)
 
 
 class BoundaryRouter(nn.Module):
@@ -270,30 +251,28 @@ class BoundaryRouter(nn.Module):
 
     Per edge (i, j):
       1. Project:  q_i = W_q · h_i,   k_j = W_k · h_j
-      2. Score:    D(i,j) = 1 − cosine_similarity(q_i, k_j)   [scalar dissimilarity]
+      2. Score:    D(i,j) = 1 − cosine_similarity(q_i, k_j)
       3. Prob:     p(i,j) = sigmoid(linear(D(i,j)))
 
-    W_q and W_k are kept small (proj_dim = 64 vs d_model = 256) so the router
-    learns which subspace of the representation is relevant for boundary detection,
-    without adding many parameters.
+    Uses a Straight-Through Estimator (forward pass makes a hard 0/1
+    boundary decision, backward pass lets gradients flow through the soft
+    probability as if the hard threshold never happened, keeping the router
+    trainable despite the discrete decision).
 
-    Straight-Through Estimator (STE — forward pass uses the hard 0/1 threshold
-    decision, backward pass lets gradients flow through as if the operation were
-    continuous) converts soft probabilities to binary boundary decisions.
-
-    Also computes L_ratio, the ratio loss that prevents the router collapsing to
-    "keep all tokens" (no compression) or "one giant group" (over-compression).
+    The ratio loss prevents the router collapsing to all-boundaries or
+    one-giant-group. Its target boundary fraction is derived from the actual
+    grid topology rather than a fixed fraction so it works correctly across
+    different patch sizes — see the comment in forward() for the derivation.
     """
 
     def __init__(self, d_model: int, proj_dim: int = 64, grid_size: int = 14):
         super().__init__()
         self.W_q           = nn.Linear(d_model, proj_dim, bias=False)
         self.W_k           = nn.Linear(d_model, proj_dim, bias=False)
-        # Learnable affine transform on the scalar cosine distance before sigmoid
         self.score_to_prob = nn.Linear(1, 1)
 
         edges = _build_edge_indices(grid_size)
-        self.register_buffer("edge_indices", edges)  # (E, 2) — fixed structure
+        self.register_buffer("edge_indices", edges)
 
     def forward(
         self,
@@ -302,136 +281,203 @@ class BoundaryRouter(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         h:                 (B, N, D) encoder hidden states
-        target_group_size: target average tokens per group (N in the ratio loss)
+        target_group_size: desired average tokens per group
 
         Returns:
-            hard:    (B, E) binary boundary decisions with STE gradient attachment
+            hard:    (B, E) binary boundary decisions with Straight-Through gradient
             probs:   (B, E) soft boundary probabilities
             l_ratio: scalar ratio loss
         """
-        idx_i = self.edge_indices[:, 0]   # (E,)
+        idx_i = self.edge_indices[:, 0]
         idx_j = self.edge_indices[:, 1]
 
-        # Project all token positions at once, then index into edge endpoints
-        q = self.W_q(h)                   # (B, N, proj_dim)
+        q = self.W_q(h)
         k = self.W_k(h)
 
-        q_i = q[:, idx_i, :]             # (B, E, proj_dim)
+        q_i = q[:, idx_i, :]
         k_j = k[:, idx_j, :]
 
-        # Dissimilarity score per edge: 0 = identical direction, 2 = opposite
-        sim = F.cosine_similarity(q_i, k_j, dim=-1)   # (B, E)
-        D   = (1.0 - sim).unsqueeze(-1)                # (B, E, 1)
+        sim   = F.cosine_similarity(q_i, k_j, dim=-1)
+        D     = (1.0 - sim).unsqueeze(-1)
+        probs = torch.sigmoid(self.score_to_prob(D)).squeeze(-1)
 
-        # Soft boundary probability via learned affine + sigmoid
-        probs = torch.sigmoid(self.score_to_prob(D)).squeeze(-1)  # (B, E)
-
-        # Hard decision via STE:
-        #   forward:  hard = threshold(probs)  — actual 0 or 1
-        #   backward: gradient flows through probs as if hard = probs
-        hard = (probs > 0.5).float() + probs - probs.detach()    # (B, E)
+        hard = (probs > 0.5).float() + probs - probs.detach()
 
         # --- Ratio loss ---
-        N = target_group_size
-        F_rate = hard.detach().mean(dim=-1)   # (B,) — per-image hard boundary rate
-        G_rate = probs.mean(dim=-1)           # (B,) — per-image mean soft probability
+        #
+        # The original formulation used N = target_group_size directly,
+        # targeting F = 1/N of edges as boundaries. This breaks on different
+        # patch sizes because the same boundary fraction produces different
+        # group counts depending on how many edges the grid has relative to
+        # its token count.
+        #
+        # Fix: derive target boundary fraction from actual grid topology.
+        #
+        # Spanning forest argument: a forest with G trees on T nodes needs
+        # exactly T-G internal (non-boundary) edges. Everything else is a
+        # boundary. So:
+        #
+        #   F_target = (n_edges - n_tokens + G_target) / n_edges
+        #   G_target = n_tokens / target_group_size
+        #
+        # This gives F_target ≈ 0.64 for both 14×14 and 28×28 grids.
+        # Critically, this is above 0.5 — the percolation threshold (the
+        # point below which a giant connected component forms and swallows
+        # most tokens into a few huge groups). The original N=3 targeted
+        # F=0.33, well below this threshold, which is why 8×8 patches
+        # collapsed to ~100 groups instead of ~261.
+        n_tokens = h.shape[1]
+        n_edges  = self.edge_indices.shape[0]
+        g_target = n_tokens / target_group_size
+        f_target = (n_edges - n_tokens + g_target) / n_edges
+        f_target = max(f_target, 1e-6)
+        N        = 1.0 / f_target
+
+        F_rate = hard.detach().mean(dim=-1)
+        G_rate = probs.mean(dim=-1)
 
         l_ratio = (N / (N - 1)) * (
             (N - 1) * F_rate * G_rate
             + (1 - F_rate) * (1 - G_rate)
         )
-        l_ratio = l_ratio.mean()              # scalar
+        l_ratio = l_ratio.mean()
 
         return hard, probs, l_ratio
 
 
 # ---------------------------------------------------------------------------
-# Connected Components (union-find, CPU, per image)
+# GPU-native Connected Components via Iterative Label Propagation
 # ---------------------------------------------------------------------------
 
-def _union_find(n_tokens: int, edges: list, boundaries: list) -> list[int]:
-    """
-    Union-Find with path compression to find connected components.
-
-    Two tokens are connected (same group) if the boundary between them is 0.
-    Returns a list of length n_tokens where each entry is a contiguous group id.
-    """
-    parent = list(range(n_tokens))
-
-    def find(x: int) -> int:
-        while parent[x] != x:
-            parent[x] = parent[parent[x]]   # halving path compression
-            x = parent[x]
-        return x
-
-    def union(x: int, y: int):
-        px, py = find(x), find(y)
-        if px != py:
-            parent[px] = py
-
-    for (i, j), b in zip(edges, boundaries):
-        if b == 0:          # no boundary → merge into same group
-            union(i, j)
-
-    # Remap roots to contiguous ids starting at 0
-    root_to_id: dict[int, int] = {}
-    result = []
-    for i in range(n_tokens):
-        root = find(i)
-        if root not in root_to_id:
-            root_to_id[root] = len(root_to_id)
-        result.append(root_to_id[root])
-
-    return result
-
-
-def find_groups(
+def gpu_connected_components(
     hard: torch.Tensor,
     edge_indices: torch.Tensor,
     n_tokens: int,
-) -> list[list[int]]:
+    n_iters: int = 10,
+) -> torch.Tensor:
     """
-    Run connected components for every image in the batch.
+    Finds connected components (groups of tokens with no boundary between them)
+    entirely on the GPU using iterative label propagation.
 
-    hard:         (B, E) detached hard boundary decisions (0 = same group, 1 = boundary)
-    edge_indices: (E, 2)
+    Replaces the previous CPU union-find + ThreadPoolExecutor approach, which
+    had two hard sync points (GPU→CPU transfer before union-find, CPU→GPU
+    transfer after) that forced the GPU to completely stall every forward pass.
+    This implementation never leaves the GPU.
 
-    Returns list of B group-assignment lists, each of length n_tokens.
+    Algorithm:
+      1. Each token starts labelled with its own index.
+      2. On each iteration, every token takes the minimum label of its
+         non-boundary neighbours via scatter_reduce with 'amin' (scatter-reduce
+         is a GPU operation that accumulates values into target index positions
+         — here taking the minimum across all edges pointing to each token).
+      3. After enough iterations, all tokens in a connected component share the
+         same label (the minimum token index in that component).
+      4. Labels are remapped to contiguous IDs [0, n_groups) per image using
+         a sort + cumsum — both are fast GPU primitives.
+
+    Convergence: for components of size K arranged in a line (worst case
+    shape), you need K-1 iterations. With target_group_size=3, 3 iterations
+    suffices. n_iters=10 handles worst-case outliers safely for grids up to
+    28×28 without meaningfully affecting runtime since each iteration is
+    just a handful of tensor ops on small tensors.
+
+    Args:
+        hard:         (B, E) hard boundary decisions — 1=boundary, 0=connected
+        edge_indices: (E, 2) adjacency pairs, registered buffer from BoundaryRouter
+        n_tokens:     N — number of tokens per image
+        n_iters:      propagation steps; 10 is safe for both 14×14 and 28×28 grids
+
+    Returns:
+        labels: (B, N) int64 — contiguous group IDs in [0, n_groups_per_image)
     """
-    from concurrent.futures import ThreadPoolExecutor
+    B      = hard.shape[0]
+    device = hard.device
 
-    edges     = edge_indices.tolist()
-    hard_list = hard.cpu().tolist()
+    idx_i     = edge_indices[:, 0]   # (E,)
+    idx_j     = edge_indices[:, 1]
+    connected = hard < 0.5           # (B, E) — True means same group (no boundary)
 
-    with ThreadPoolExecutor() as pool:
-        results = list(pool.map(
-            lambda b_hard: _union_find(n_tokens, edges, b_hard),
-            hard_list,
-        ))
-    return results
+    # Each token starts as its own group, labelled by its own index.
+    # After propagation, all tokens in a component converge to the minimum index.
+    labels = (
+        torch.arange(n_tokens, device=device)
+        .unsqueeze(0)
+        .expand(B, -1)
+        .clone()
+    )  # (B, N)
+
+    # INF sentinel: larger than any valid label, so boundary edges contribute
+    # nothing to the amin reduction (they get ignored).
+    INF = n_tokens
+
+    # Pre-expand edge index tensors once — reused every iteration
+    idx_i_exp = idx_i.unsqueeze(0).expand(B, -1)  # (B, E)
+    idx_j_exp = idx_j.unsqueeze(0).expand(B, -1)
+
+    for _ in range(n_iters):
+        label_i = labels[:, idx_i]   # (B, E) — current label at each edge's source
+        label_j = labels[:, idx_j]   # (B, E) — current label at each edge's dest
+
+        # The label to spread through each edge: minimum of both endpoints.
+        # For boundary edges, use INF so they don't affect the amin reduction.
+        min_ij    = torch.minimum(label_i, label_j)                      # (B, E)
+        propagate = torch.where(connected, min_ij, min_ij.new_full((), INF))  # (B, E)
+
+        # Scatter the minimum label to both endpoints of every connected edge.
+        # scatter_reduce_ with 'amin' and include_self=True takes the minimum
+        # of the token's existing label and everything scattered to it this step.
+        new_labels = labels.clone()
+        new_labels.scatter_reduce_(1, idx_j_exp, propagate, reduce='amin', include_self=True)
+        new_labels.scatter_reduce_(1, idx_i_exp, propagate, reduce='amin', include_self=True)
+        labels = new_labels
+
+    # --- Remap non-contiguous root labels → contiguous IDs [0, n_groups) ---
+    #
+    # After propagation, labels are the minimum token index in each component
+    # (e.g. [0, 0, 5, 5, 3, 3, ...]). We need contiguous IDs (e.g. [0, 0, 2, 2, 1, 1])
+    # so that GroupMerge's scatter and pad-mask arithmetic work correctly.
+    #
+    # Method: sort tokens by label within each image. Wherever the label changes
+    # in the sorted order, that's a new group. cumsum over those change-points
+    # gives contiguous IDs in sorted order; scatter puts them back in token order.
+
+    sorted_labels, sort_idx = labels.sort(dim=1)          # (B, N)
+
+    is_new_group = torch.cat([
+        torch.ones(B, 1, device=device, dtype=torch.bool),
+        sorted_labels[:, 1:] != sorted_labels[:, :-1],
+    ], dim=1)                                              # (B, N) — True at each group's first token
+
+    contiguous_sorted = is_new_group.long().cumsum(dim=1) - 1  # (B, N) — IDs in sorted order
+
+    # Unsort: put contiguous IDs back at original token positions
+    contiguous_labels = torch.empty_like(labels)
+    contiguous_labels.scatter_(1, sort_idx, contiguous_sorted)  # (B, N)
+
+    return contiguous_labels
 
 
 # ---------------------------------------------------------------------------
 # Group Merging + Projection
 # ---------------------------------------------------------------------------
 
-_GROUP_STRIDE = 1000  # max possible groups per image — must exceed worst case (all tokens)
+# Fixed stride between images in the flattened group index space.
+# Must exceed the maximum possible groups per image (= n_tokens, when every
+# token is isolated). 1000 covers up to 28×28 = 784 tokens with a buffer.
+_GROUP_STRIDE = 1000
 
 
 class GroupMerge(nn.Module):
     """
     Merges each connected-component group into a single token via mean pooling,
-    then applies a linear projection to decouple the encoder and main-network spaces.
+    then applies a linear projection.
 
-    Token value:    differentiable mean pool of constituent encoder hidden states
-                    (gradients flow back through scatter_add → encoder)
-    Token position: mean of constituent (row, col) coordinates
-                    (not differentiable — only used for RoPE in the main network)
+    Accepts a (B, N) integer tensor of contiguous group IDs directly from
+    gpu_connected_components — no Python loops, no CPU involvement.
 
-    Vectorized: group IDs are made globally unique across the batch by adding a
-    fixed per-image offset (_GROUP_STRIDE * image_index). This lets a single
-    scatter_add_ across all B*N tokens replace the original per-image Python loop,
-    eliminating the CPU bottleneck that slows training at large batch sizes.
+    Vectorized via a fixed-stride offset trick: image b's group IDs are shifted
+    by b * _GROUP_STRIDE so all B*N tokens can be processed in a single
+    scatter_add_ call instead of B separate ones.
     """
 
     def __init__(self, d_model: int):
@@ -442,12 +488,12 @@ class GroupMerge(nn.Module):
         self,
         h: torch.Tensor,
         coords: torch.Tensor,
-        all_groups: list[list[int]],
+        group_ids: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, float]:
         """
-        h:          (B, N, D) encoder hidden states
-        coords:     (N, 2)    patch grid coordinates
-        all_groups: B group-assignment lists, each of length N
+        h:         (B, N, D) encoder hidden states
+        coords:    (N, 2)    patch grid coordinates
+        group_ids: (B, N)    contiguous group IDs from gpu_connected_components
 
         Returns:
             padded_tokens: (B, max_G, D)
@@ -458,40 +504,31 @@ class GroupMerge(nn.Module):
         B, N, D = h.shape
         device  = h.device
 
-        # (B, N) — raw group ids, unique only within each image
-        group_ids = torch.tensor(all_groups, device=device, dtype=torch.long)
-
-        # Number of groups per image: max id + 1
         n_groups_per_image = group_ids.max(dim=1).values + 1  # (B,)
 
-        # Make group ids globally unique by shifting each image by _GROUP_STRIDE.
-        # Image 0: ids stay as-is. Image 1: ids += 1000. Image 2: ids += 2000. Etc.
+        # Make group IDs globally unique across the batch to enable a single
+        # scatter_add_ call for all B*N tokens at once.
         offsets    = torch.arange(B, device=device, dtype=torch.long) * _GROUP_STRIDE
         global_ids = group_ids + offsets.unsqueeze(1)  # (B, N)
 
-        # Flatten to (B*N,) so one scatter_add_ handles the whole batch at once
         flat_h   = h.reshape(B * N, D)
         flat_ids = global_ids.reshape(B * N)
 
-        # Accumulate feature sums and token counts into (B*_GROUP_STRIDE,) buckets
         feat_sum = torch.zeros(B * _GROUP_STRIDE, D, device=device, dtype=h.dtype)
         counts   = torch.zeros(B * _GROUP_STRIDE,    device=device, dtype=h.dtype)
         feat_sum.scatter_add_(0, flat_ids.unsqueeze(-1).expand(-1, D), flat_h)
         counts.scatter_add_(0, flat_ids, torch.ones(B * N, device=device, dtype=h.dtype))
 
-        # Divide to get mean features; clamp avoids divide-by-zero on empty slots
         group_feats = (feat_sum / counts.unsqueeze(-1).clamp(min=1)).view(B, _GROUP_STRIDE, D)
 
-        # Slice down to the largest actual group count in this batch
         max_G         = int(n_groups_per_image.max().item())
         padded_tokens = self.proj(group_feats[:, :max_G, :])  # (B, max_G, D)
 
-        # Pad mask: True = padding slot, False = real group token
-        # arange (1, max_G) broadcast against n_groups_per_image (B, 1)
+        # Pad mask: True = padding slot, False = real group.
+        # Broadcasting comparison — no loop needed.
         arange   = torch.arange(max_G, device=device).unsqueeze(0)  # (1, max_G)
         pad_mask = arange >= n_groups_per_image.unsqueeze(1)         # (B, max_G)
 
-        # Coords — same scatter logic, no grad needed
         with torch.no_grad():
             coord_sum = torch.zeros(B * _GROUP_STRIDE, 2, device=device)
             coord_sum.scatter_add_(
@@ -514,21 +551,15 @@ class ASFNet(nn.Module):
     """
     Attention-Shifted Focus Network.
 
-    A ViT augmented with content-adaptive spatial grouping: similar adjacent
-    patches are merged into single group tokens, reducing sequence length
-    based on image content before the main transformer reasoning stage.
-
     Pipeline:
-      PatchEmbed                          196 tokens, 14×14 grid
+      PatchEmbed                          N tokens (grid_size × grid_size)
       → encoder_blocks × TransformerBlock build semantic representations
       → BoundaryRouter                    score every adjacent pair
-      → ConnectedComponents               flood-fill groups from hard boundaries
+      → gpu_connected_components          label propagation entirely on GPU
       → GroupMerge                        mean-pool + project → adaptive token count
       → main_blocks × TransformerBlock    reason over compressed token set
       → masked Global Average Pool
       → Linear classifier
-
-    ~5.58M parameters with defaults (d_model=256, enc=2, main=6, mlp_ratio=3).
     """
 
     def __init__(
@@ -567,6 +598,12 @@ class ASFNet(nn.Module):
         self.norm       = nn.LayerNorm(d_model)
         self.classifier = nn.Linear(d_model, num_classes)
 
+        # n_iters for label propagation: log2(n_tokens) guarantees convergence
+        # for any component size. For target_group_size=3, ~3 iters suffice;
+        # this just handles worst-case outliers without meaningfully affecting speed.
+        n_tokens   = (image_size // patch_size) ** 2
+        self._cc_iters = max(int(math.ceil(math.log2(n_tokens))), 4)
+
     def forward(
         self,
         x: torch.Tensor,
@@ -579,41 +616,36 @@ class ASFNet(nn.Module):
             l_ratio:     scalar — ratio loss to add to task loss during training
             mean_groups: float  — avg group tokens per image (diagnostic)
         """
-        # Stage 1: Patch embedding
-        tokens, coords = self.patch_embed(x)    # (B, 196, D), (196, 2)
+        tokens, coords = self.patch_embed(x)
 
-        # Stage 2: Encoder — build semantic representations before routing
         for block in self.encoder:
-            tokens = block(tokens, coords)       # coords shared, no mask needed
+            tokens = block(tokens, coords)
 
-        # Stage 3: Routing — score every adjacent pair, compute ratio loss
         hard, probs, l_ratio = self.router(tokens, self.target_group_size)
 
-        # Stage 4: Connected components — group assignments per image
-        all_groups = find_groups(
+        # Connected components entirely on GPU — no CPU transfers, no stalls
+        group_ids = gpu_connected_components(
             hard.detach(),
             self.router.edge_indices,
             tokens.shape[1],
+            n_iters=self._cc_iters,
         )
 
-        # Stage 5: Group merging — mean pool + project → variable-length token sequences
         padded_tokens, padded_coords, pad_mask, mean_groups = self.group_merge(
-            tokens, coords, all_groups
+            tokens, coords, group_ids,
         )
 
-        # Stage 6: Main network — reason over compressed tokens
         for block in self.main_net:
             padded_tokens = block(padded_tokens, padded_coords, pad_mask)
 
         padded_tokens = self.norm(padded_tokens)
 
-        # Stage 7: Masked global average pool — exclude padding tokens
-        real_mask   = (~pad_mask).float()                                      # (B, max_G)
-        token_sum   = (padded_tokens * real_mask.unsqueeze(-1)).sum(dim=1)    # (B, D)
-        token_count = real_mask.sum(dim=1, keepdim=True).clamp(min=1)         # (B, 1)
-        pooled      = token_sum / token_count                                  # (B, D)
+        real_mask   = (~pad_mask).float()
+        token_sum   = (padded_tokens * real_mask.unsqueeze(-1)).sum(dim=1)
+        token_count = real_mask.sum(dim=1, keepdim=True).clamp(min=1)
+        pooled      = token_sum / token_count
 
-        logits = self.classifier(pooled)   # (B, num_classes)
+        logits = self.classifier(pooled)
         return logits, l_ratio, mean_groups
 
     def count_parameters(self) -> dict:
