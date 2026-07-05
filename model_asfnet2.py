@@ -24,16 +24,7 @@ from typing import Optional
 
 # Shared components — imported to avoid duplication.
 # model_asfnet2 inherits any bug-fixes made to these automatically.
-from model_asfnet import (
-    PatchEmbed,
-    apply_rope_2d,
-    Attention,
-    TransformerBlock,
-    BoundaryRouter,
-    _GROUP_STRIDE,
-    GroupMerge,
-    gpu_connected_components,
-)
+from model_asfnet import *
 
 
 # ---------------------------------------------------------------------------
@@ -347,6 +338,8 @@ class ASFNet2(nn.Module):
         target_group_size_2:  float = 3.0,  # Stage 2 compression: G1 → G1/target_group_size_2
         router_proj_dim:      int   = 64,
         knn_k:                int   = 6,
+        local_encoder1: bool = False,
+        local_radius: int = 1,
     ):
         super().__init__()
         self.target_group_size_1 = target_group_size_1
@@ -356,10 +349,17 @@ class ASFNet2(nn.Module):
 
         self.patch_embed = PatchEmbed(image_size, patch_size, in_channels, d_model)
 
-        self.encoder1 = nn.ModuleList([
-            TransformerBlock(d_model, num_heads, mlp_ratio)
-            for _ in range(encoder1_blocks)
-        ])
+        self.local_encoder1 = local_encoder1
+        if local_encoder1:
+            self.encoder1 = nn.ModuleList([
+                LocalTransformerBlock(d_model, num_heads, grid_size, local_radius, mlp_ratio)
+                for _ in range(encoder1_blocks)
+            ])
+        else:
+            self.encoder1 = nn.ModuleList([
+                TransformerBlock(d_model, num_heads, mlp_ratio)
+                for _ in range(encoder1_blocks)
+            ])
 
         # Stage 1: same fixed-grid router as original ASFNet
         self.router1  = BoundaryRouter(d_model, router_proj_dim, grid_size)
@@ -493,3 +493,4 @@ class ASFNet2(nn.Module):
             "norm+head":    n(self.norm) + n(self.classifier),
             "total":        n(self),
         }
+

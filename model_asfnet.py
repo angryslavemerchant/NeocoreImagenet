@@ -222,6 +222,142 @@ class TransformerBlock(nn.Module):
         x = x + self.ffn(self.norm2(x))
         return x
 
+# =============================================================================
+# Local-neighbourhood attention for encoder1 (additive — paste into
+# model_asfnet.py, below the existing Attention / TransformerBlock defs).
+#
+# These reuse the existing apply_rope_2d and mirror Attention/TransformerBlock
+# exactly, differing only in that each token may attend to a fixed square
+# window around it on the patch grid instead of the whole image.
+#
+# Nothing here touches existing classes, so current ASFNet / ASFNet2 runs and
+# checkpoints are unaffected. ASFNet2 opts in via a flag (see the __init__ diff
+# in the accompanying message).
+# =============================================================================
+
+
+def _build_neighborhood_mask(grid_size: int, radius: int) -> torch.Tensor:
+    """
+    Boolean (N, N) attention mask for a grid_size x grid_size patch grid.
+
+    Entry (i, j) is True iff patch j lies within Chebyshev distance `radius`
+    of patch i — i.e. inside the (2*radius+1) square window centred on i.
+    True = "j participates in i's attention" (SDPA bool-mask convention).
+    Self is always included (distance 0), so every row has at least one True
+    and no token can produce a NaN from an all-masked row.
+
+    Token ordering matches PatchEmbed: index = row * grid_size + col
+    (row-major flatten of the (grid, grid) feature map), so the mask lines up
+    with the token sequence without any reindexing.
+    """
+    coords = torch.stack(
+        torch.meshgrid(
+            torch.arange(grid_size),
+            torch.arange(grid_size),
+            indexing="ij",
+        ),
+        dim=-1,
+    ).reshape(-1, 2)                                   # (N, 2) integer (row, col)
+
+    diff = (coords[:, None, :] - coords[None, :, :]).abs()   # (N, N, 2)
+    cheb = diff.max(dim=-1).values                           # (N, N) Chebyshev dist
+    return cheb <= radius                                    # (N, N) bool
+
+
+class LocalAttention(nn.Module):
+    """
+    Multi-head self-attention restricted to a local grid neighbourhood.
+
+    Structurally identical to Attention (same qkv/out projections, same 2D
+    rotary positional encoding applied to q and k) except each token may only
+    attend to tokens inside a fixed square window on the patch grid. The window
+    is supplied as a boolean (N, N) mask (True = allowed) and broadcast over
+    batch and heads.
+
+    Position is still encoded globally via RoPE — every token carries its true
+    grid coordinate. The mask only restricts *which pairs interact*, not where
+    each token thinks it is.
+    """
+
+    def __init__(self, d_model: int, num_heads: int):
+        super().__init__()
+        assert d_model % num_heads == 0
+        self.num_heads = num_heads
+        self.head_dim  = d_model // num_heads
+
+        self.qkv = nn.Linear(d_model, 3 * d_model, bias=False)
+        self.out = nn.Linear(d_model, d_model, bias=False)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        coords: torch.Tensor,
+        neighborhood: torch.Tensor,
+    ) -> torch.Tensor:
+        B, N, D = x.shape
+
+        qkv = self.qkv(x)
+        q, k, v = qkv.chunk(3, dim=-1)
+
+        def to_heads(t: torch.Tensor) -> torch.Tensor:
+            return t.view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
+
+        q, k, v = to_heads(q), to_heads(k), to_heads(v)
+        q, k = apply_rope_2d(q, k, coords, self.head_dim)
+
+        # neighborhood: (N, N) bool → (1, 1, N, N), broadcasts over (B, heads).
+        out = F.scaled_dot_product_attention(q, k, v, attn_mask=neighborhood[None, None])
+        out = out.transpose(1, 2).reshape(B, N, D)
+        return self.out(out)
+
+
+class LocalTransformerBlock(nn.Module):
+    """
+    Pre-norm transformer block whose attention is restricted to a local grid
+    neighbourhood (see LocalAttention). Feed-forward is unchanged.
+
+    Owns its neighbourhood mask as a non-persistent buffer, built once from
+    (grid_size, radius). Non-persistent so it is *not* written into the
+    checkpoint — it is fully derivable from config, so checkpoints stay clean
+    and changing `radius` later can't cause a state_dict shape mismatch.
+
+    forward takes (x, coords) only. encoder1 processes all 196 patch tokens
+    with no padding, so there is no padding mask to thread through — which is
+    exactly why this is a drop-in for the existing `block(tokens, coords)` call.
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        num_heads: int,
+        grid_size: int,
+        radius: int,
+        mlp_ratio: float = 3.0,
+    ):
+        super().__init__()
+        ffn_dim = int(d_model * mlp_ratio)
+
+        self.norm1 = nn.LayerNorm(d_model)
+        self.attn  = LocalAttention(d_model, num_heads)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.ffn   = nn.Sequential(
+            nn.Linear(d_model, ffn_dim),
+            nn.GELU(),
+            nn.Linear(ffn_dim, d_model),
+        )
+
+        self.register_buffer(
+            "neighborhood",
+            _build_neighborhood_mask(grid_size, radius),
+            persistent=False,
+        )
+
+    def forward(self, x: torch.Tensor, coords: torch.Tensor) -> torch.Tensor:
+        x = x + self.attn(self.norm1(x), coords, self.neighborhood)
+        x = x + self.ffn(self.norm2(x))
+        return x
+
+
 
 # ---------------------------------------------------------------------------
 # Boundary Router

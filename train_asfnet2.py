@@ -205,6 +205,11 @@ def main():
                         help="Stage 2 k-NN neighbours per token. k=6 gives richer "
                              "connectivity than the Stage 1 grid's effective k=4.")
 
+    parser.add_argument("--local_encoder1", action="store_true",
+                        help="Use local-neighbourhood attention in encoder1")
+    parser.add_argument("--local_radius", type=int, default=1,
+                        help="Chebyshev radius of the encoder1 attention window")
+
     # --- Training ---
     parser.add_argument("--batch_size",          type=int,   default=1024)
     parser.add_argument("--num_epochs",          type=int,   default=90)

@@ -534,6 +534,9 @@ def main():
     grid_size  = ckpt_args["image_size"] // ckpt_args["patch_size"]
     patch_size = ckpt_args["patch_size"]
 
+    local_encoder1 = args.get("local_encoder1", False),
+    local_radius = args.get("local_radius", 1),
+
     if not args.no_accuracy:
         run_accuracy(model, val_loader, device)
 
