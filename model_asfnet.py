@@ -358,6 +358,103 @@ class LocalTransformerBlock(nn.Module):
         return x
 
 
+# =============================================================================
+# Stage 2 local attention (additive — paste into model_asfnet.py, below the
+# Stage 1 LocalAttention / LocalTransformerBlock you already added).
+#
+# Difference from Stage 1: the neighbourhood is not a fixed grid window shared
+# across the batch. Stage 2 tokens are irregular groups with per-image k-NN
+# adjacency, so the mask is a per-image (B, G, G) boolean passed in at forward
+# time rather than a buffer built once from grid_size + radius.
+#
+# The mask itself is built in model_asfnet2.py (knn_edges_to_mask) from the same
+# src/dst/valid edges that feed BoundaryRouter2, so the encoder mixes tokens over
+# exactly the graph the router then cuts.
+# =============================================================================
+
+
+class LocalAttention2(nn.Module):
+    """
+    Multi-head self-attention with an explicit per-image neighbourhood mask.
+
+    Same projections and same 2D rotary positional encoding on q/k as the
+    global Attention — only the set of keys each query may see is restricted.
+    Query i attends to key j iff mask[b, i, j] is True.
+
+    Used for Stage 2, where the neighbourhood is the per-image k-nearest-
+    neighbour graph over group centroids. coords here is (B, G, 2) — the
+    per-image fractional group centroids — which apply_rope_2d already handles.
+    """
+
+    def __init__(self, d_model: int, num_heads: int):
+        super().__init__()
+        assert d_model % num_heads == 0
+        self.num_heads = num_heads
+        self.head_dim  = d_model // num_heads
+
+        self.qkv = nn.Linear(d_model, 3 * d_model, bias=False)
+        self.out = nn.Linear(d_model, d_model, bias=False)
+
+    def forward(
+        self,
+        x: torch.Tensor,       # (B, G, D)
+        coords: torch.Tensor,  # (B, G, 2) per-image group centroids
+        mask: torch.Tensor,    # (B, G, G) bool, True = attend
+    ) -> torch.Tensor:
+        B, N, D = x.shape
+
+        qkv = self.qkv(x)
+        q, k, v = qkv.chunk(3, dim=-1)
+
+        def to_heads(t: torch.Tensor) -> torch.Tensor:
+            return t.view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
+
+        q, k, v = to_heads(q), to_heads(k), to_heads(v)
+        q, k = apply_rope_2d(q, k, coords, self.head_dim)
+
+        # mask: (B, G, G) → (B, 1, G, G), broadcast over heads.
+        out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask[:, None])
+        out = out.transpose(1, 2).reshape(B, N, D)
+        return self.out(out)
+
+
+class LocalTransformerBlock2(nn.Module):
+    """
+    Pre-norm transformer block whose attention is restricted to a per-image
+    neighbourhood mask (see LocalAttention2). Feed-forward unchanged.
+
+    Unlike the Stage 1 LocalTransformerBlock this owns no buffer — the mask is
+    dynamic (differs per image, per batch) and is passed in at forward time.
+    forward signature (x, coords, mask) mirrors the global block's
+    (x, coords, attn_mask), so swapping block types in encoder2 needs no change
+    to how the loop is written beyond passing the right mask.
+    """
+
+    def __init__(self, d_model: int, num_heads: int, mlp_ratio: float = 3.0):
+        super().__init__()
+        ffn_dim = int(d_model * mlp_ratio)
+
+        self.norm1 = nn.LayerNorm(d_model)
+        self.attn  = LocalAttention2(d_model, num_heads)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.ffn   = nn.Sequential(
+            nn.Linear(d_model, ffn_dim),
+            nn.GELU(),
+            nn.Linear(ffn_dim, d_model),
+        )
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        coords: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> torch.Tensor:
+        x = x + self.attn(self.norm1(x), coords, mask)
+        x = x + self.ffn(self.norm2(x))
+        return x
+
+
+
 
 # ---------------------------------------------------------------------------
 # Boundary Router
