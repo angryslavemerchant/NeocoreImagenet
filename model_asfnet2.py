@@ -408,6 +408,7 @@ class ASFNet2(nn.Module):
         local_encoder1: bool = False,
         local_radius: int = 1,
         local_encoder2: bool = False,
+        local_encoder2_safe: bool = False,
     ):
         super().__init__()
         self.target_group_size_1 = target_group_size_1
@@ -436,7 +437,8 @@ class ASFNet2(nn.Module):
         self.local_encoder2 = local_encoder2
         if local_encoder2:
             self.encoder2 = nn.ModuleList([
-                LocalTransformerBlock2(d_model, num_heads, mlp_ratio)
+                LocalTransformerBlock2(d_model, num_heads, mlp_ratio,
+                                       safe_attn=local_encoder2_safe)
                 for _ in range(encoder2_blocks)
             ])
         else:

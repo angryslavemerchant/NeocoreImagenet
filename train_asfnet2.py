@@ -41,6 +41,7 @@ def build_model(args) -> ASFNet2:
         local_encoder1       = args.local_encoder1,
         local_radius         = args.local_radius,
         local_encoder2       = args.local_encoder2,
+        local_encoder2_safe  = args.local_encoder2_safe,
     )
 
 
@@ -76,6 +77,8 @@ def train_one_epoch(
     top5          = AverageMeter()
     groups1       = AverageMeter()
     groups2       = AverageMeter()
+    grad_norms    = AverageMeter()
+    nan_batches   = 0
 
     pbar = tqdm(loader, desc=f"Epoch {epoch+1}/{args.num_epochs} [train]", leave=False)
 
@@ -91,10 +94,24 @@ def train_one_epoch(
                          + args.ratio_loss_weight   * l_ratio1
                          + args.ratio_loss_weight_2 * l_ratio2)
 
+        # Finite-loss guard: if the loss goes NaN/inf, skip the step rather than
+        # backpropagating garbage, and count it so the collapse is visible in
+        # wandb (a rising nan_batches localises numeric blow-ups in time).
+        if not torch.isfinite(loss).item():
+            nan_batches += 1
+            optimizer.zero_grad(set_to_none=True)
+            images_seen += B
+            global_step += 1
+            continue
+
         optimizer.zero_grad()
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
-        nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+        # clip_grad_norm_ returns the total gradient norm BEFORE clipping — this
+        # is the diagnostic signal. A spike here at the loss reversal = training
+        # instability; inf/NaN here = numeric blow-up upstream.
+        grad_norm = nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+        grad_norms.update(float(grad_norm), B)
         scaler.step(optimizer)
         scaler.update()
 
@@ -128,6 +145,9 @@ def train_one_epoch(
                 "train/mean_groups_1": groups1.avg,
                 "train/mean_groups_2": groups2.avg,
                 "train/grad_scale":    scaler.get_scale(),
+                "train/grad_norm":     float(grad_norm),   # instantaneous (latest batch)
+                "train/grad_norm_avg": grad_norms.avg,     # running average this epoch
+                "train/nan_batches":   nan_batches,        # cumulative this epoch
                 "train/images_seen":   images_seen,
             }, step=global_step)
 
@@ -215,6 +235,10 @@ def main():
     parser.add_argument("--local_encoder2", action="store_true",
                         help="Use k-NN local attention in encoder2 (mask = the same "
                              "per-image k-NN graph the Stage 2 router cuts)")
+    parser.add_argument("--local_encoder2_safe", action="store_true",
+                        help="Diagnostic: run encoder2 local attention in float32 with "
+                             "an additive mask + math backend, to rule out low-precision "
+                             "/ fused-kernel instability. Slower; disable torch.compile.")
 
     # --- Training ---
     parser.add_argument("--batch_size",          type=int,   default=1024)

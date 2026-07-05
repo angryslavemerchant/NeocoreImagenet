@@ -66,6 +66,7 @@ def _load_model(path: str, device: torch.device) -> tuple[ASFNet2, dict]:
         local_encoder1      = a.get("local_encoder1", False),
         local_radius        = a.get("local_radius", 1),
         local_encoder2      = a.get("local_encoder2", False),
+        local_encoder2_safe = a.get("local_encoder2_safe", False),
     )
     model.load_state_dict(ckpt["model"])
     model.to(device).eval()

@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional
+from torch.nn.attention import sdpa_kernel, SDPBackend
 
 
 # ---------------------------------------------------------------------------
@@ -358,18 +359,33 @@ class LocalTransformerBlock(nn.Module):
         return x
 
 
-# =============================================================================
-# Stage 2 local attention (additive — paste into model_asfnet.py, below the
-# Stage 1 LocalAttention / LocalTransformerBlock you already added).
+## =============================================================================
+# Stage 2 local attention — with an optional numerically-safe path.
 #
-# Difference from Stage 1: the neighbourhood is not a fixed grid window shared
-# across the batch. Stage 2 tokens are irregular groups with per-image k-NN
-# adjacency, so the mask is a per-image (B, G, G) boolean passed in at forward
-# time rather than a buffer built once from grid_size + radius.
+# REPLACES the LocalAttention2 / LocalTransformerBlock2 you pasted earlier into
+# model_asfnet.py. Behaviour with safe_attn=False is identical to before, so
+# existing runs are unaffected. safe_attn=True switches the Stage 2 local
+# attention to a reference implementation used to rule out low-precision /
+# fused-kernel instability as the cause of the local/local collapse:
 #
-# The mask itself is built in model_asfnet2.py (knn_edges_to_mask) from the same
-# src/dst/valid edges that feed BoundaryRouter2, so the encoder mixes tokens over
-# exactly the graph the router then cuts.
+#   - additive float32 mask instead of a boolean mask
+#   - attention math done in float32 (autocast disabled for this op)
+#   - PyTorch's plain "math" attention backend instead of the fused
+#     flash / memory-efficient kernels
+#
+# If the collapse disappears under safe_attn=True, the cause was numerics in
+# the masked attention, not the architecture. If it still collapses, the
+# moving-graph coupling hypothesis stands and we look there next.
+#
+# NOTE: add this import near the top of model_asfnet.py (next to the other
+# torch imports):
+#
+#     from torch.nn.attention import sdpa_kernel, SDPBackend
+#
+# NOTE: the safe path uses context managers and dtype casts that torch.compile
+# tends to graph-break on. Run the diagnostic with torch.compile disabled (it's
+# a suspect anyway) — comment out the `model = torch.compile(model)` line in
+# train_asfnet2.py for this run.
 # =============================================================================
 
 
@@ -384,13 +400,21 @@ class LocalAttention2(nn.Module):
     Used for Stage 2, where the neighbourhood is the per-image k-nearest-
     neighbour graph over group centroids. coords here is (B, G, 2) — the
     per-image fractional group centroids — which apply_rope_2d already handles.
+
+    safe_attn:
+        False (default) — fast path: boolean mask, fused attention kernel,
+                          runs in whatever dtype autocast provides (bfloat16).
+        True            — reference path: additive float32 mask, math backend,
+                          attention computed in float32. Slower; used only to
+                          isolate numerical instability from architecture.
     """
 
-    def __init__(self, d_model: int, num_heads: int):
+    def __init__(self, d_model: int, num_heads: int, safe_attn: bool = False):
         super().__init__()
         assert d_model % num_heads == 0
         self.num_heads = num_heads
         self.head_dim  = d_model // num_heads
+        self.safe_attn = safe_attn
 
         self.qkv = nn.Linear(d_model, 3 * d_model, bias=False)
         self.out = nn.Linear(d_model, d_model, bias=False)
@@ -412,8 +436,28 @@ class LocalAttention2(nn.Module):
         q, k, v = to_heads(q), to_heads(k), to_heads(v)
         q, k = apply_rope_2d(q, k, coords, self.head_dim)
 
-        # mask: (B, G, G) → (B, 1, G, G), broadcast over heads.
-        out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask[:, None])
+        if self.safe_attn:
+            # Additive float32 bias: 0 where allowed, large-negative where not.
+            # finfo.min (a big finite negative) rather than -inf avoids any
+            # 0 * -inf = NaN corner; every row has a self-loop so at least one
+            # allowed entry always exists.
+            neg_inf   = torch.finfo(torch.float32).min
+            attn_bias = torch.zeros(
+                mask.shape, dtype=torch.float32, device=mask.device
+            ).masked_fill(~mask, neg_inf)[:, None]        # (B, 1, G, G)
+
+            # Disable autocast so the op truly runs in float32, and force the
+            # plain (non-fused) math backend for numerical transparency.
+            with torch.autocast(device_type="cuda", enabled=False), \
+                 sdpa_kernel(SDPBackend.MATH):
+                out = F.scaled_dot_product_attention(
+                    q.float(), k.float(), v.float(), attn_mask=attn_bias
+                )
+            out = out.to(x.dtype)
+        else:
+            # mask: (B, G, G) → (B, 1, G, G), broadcast over heads.
+            out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask[:, None])
+
         out = out.transpose(1, 2).reshape(B, N, D)
         return self.out(out)
 
@@ -428,14 +472,22 @@ class LocalTransformerBlock2(nn.Module):
     forward signature (x, coords, mask) mirrors the global block's
     (x, coords, attn_mask), so swapping block types in encoder2 needs no change
     to how the loop is written beyond passing the right mask.
+
+    safe_attn is forwarded to LocalAttention2 (see there).
     """
 
-    def __init__(self, d_model: int, num_heads: int, mlp_ratio: float = 3.0):
+    def __init__(
+        self,
+        d_model: int,
+        num_heads: int,
+        mlp_ratio: float = 3.0,
+        safe_attn: bool = False,
+    ):
         super().__init__()
         ffn_dim = int(d_model * mlp_ratio)
 
         self.norm1 = nn.LayerNorm(d_model)
-        self.attn  = LocalAttention2(d_model, num_heads)
+        self.attn  = LocalAttention2(d_model, num_heads, safe_attn=safe_attn)
         self.norm2 = nn.LayerNorm(d_model)
         self.ffn   = nn.Sequential(
             nn.Linear(d_model, ffn_dim),
@@ -452,7 +504,6 @@ class LocalTransformerBlock2(nn.Module):
         x = x + self.attn(self.norm1(x), coords, mask)
         x = x + self.ffn(self.norm2(x))
         return x
-
 
 
 
