@@ -24,19 +24,20 @@ def set_seed(seed: int):
 
 def build_model(args) -> ASFNet2:
     return ASFNet2(
-        image_size        = args.image_size,
-        patch_size        = args.patch_size,
-        in_channels       = 3,
-        d_model           = args.d_model,
-        num_heads         = args.num_heads,
-        encoder1_blocks   = args.encoder1_blocks,
-        encoder2_blocks   = args.encoder2_blocks,
-        main_blocks       = args.main_blocks,
-        mlp_ratio         = args.mlp_ratio,
-        num_classes       = args.num_classes,
-        target_group_size = args.target_group_size,
-        router_proj_dim   = args.router_proj_dim,
-        knn_k             = args.knn_k,
+        image_size           = args.image_size,
+        patch_size           = args.patch_size,
+        in_channels          = 3,
+        d_model              = args.d_model,
+        num_heads            = args.num_heads,
+        encoder1_blocks      = args.encoder1_blocks,
+        encoder2_blocks      = args.encoder2_blocks,
+        main_blocks          = args.main_blocks,
+        mlp_ratio            = args.mlp_ratio,
+        num_classes          = args.num_classes,
+        target_group_size_1  = args.target_group_size_1,
+        target_group_size_2  = args.target_group_size_2,
+        router_proj_dim      = args.router_proj_dim,
+        knn_k                = args.knn_k,
     )
 
 
@@ -192,10 +193,14 @@ def main():
                              "Default layout (2+2+4=8 blocks) gives ~5.7M params.")
     parser.add_argument("--mlp_ratio",         type=float, default=3.0)
     parser.add_argument("--num_classes",       type=int,   default=100)
-    parser.add_argument("--target_group_size", type=float, default=3.0,
-                        help="Target average tokens per group. Applied independently at "
-                             "both stages, giving ~1/9 total compression.")
-    parser.add_argument("--router_proj_dim",   type=int,   default=64)
+    parser.add_argument("--target_group_size_1", type=float, default=3.0,
+                        help="Stage 1 compression: N tokens → N/target_group_size_1 groups. "
+                             "3.0 = compress by 1/3. Higher = more aggressive compression.")
+    parser.add_argument("--target_group_size_2", type=float, default=3.0,
+                        help="Stage 2 compression: G1 groups → G1/target_group_size_2 groups. "
+                             "Independent of Stage 1. Combined effect: 1/(s1 * s2) of original. "
+                             "e.g. s1=3, s2=3 → 1/9.  s1=4, s2=2 → 1/8.")
+    parser.add_argument("--router_proj_dim",      type=int,   default=64)
     parser.add_argument("--knn_k",             type=int,   default=6,
                         help="Stage 2 k-NN neighbours per token. k=6 gives richer "
                              "connectivity than the Stage 1 grid's effective k=4.")
@@ -245,7 +250,8 @@ def main():
             f"ASFNet2_D{args.d_model}"
             f"_enc{args.encoder1_blocks}-{args.encoder2_blocks}"
             f"_main{args.main_blocks}"
-            f"_N{args.target_group_size}_k{args.knn_k}_p{args.patch_size}"
+            f"_N{args.target_group_size_1}-{args.target_group_size_2}"
+            f"_k{args.knn_k}_p{args.patch_size}"
         )
 
     wandb.init(
@@ -295,7 +301,10 @@ def main():
     print(f"\nTraining '{args.run_name}' on {device}")
     print(f"Epochs: {args.num_epochs}  |  Batch: {args.batch_size}  |  LR: {args.lr}")
     print(f"ratio_loss_weight: stage1={args.ratio_loss_weight}  stage2={args.ratio_loss_weight_2}")
-    print(f"knn_k={args.knn_k}  target_group_size={args.target_group_size}  (~1/9 overall)\n")
+    overall = args.target_group_size_1 * args.target_group_size_2
+    print(f"knn_k={args.knn_k}  "
+          f"target_group_size: stage1={args.target_group_size_1}  stage2={args.target_group_size_2}  "
+          f"(~1/{overall:.0f} overall)\n")
 
     for epoch in range(start_epoch, args.num_epochs):
         current_lr = optimizer.param_groups[0]["lr"]

@@ -2,9 +2,11 @@
 model_asfnet2.py — Two-stage hierarchical ASFNet.
 
 Applies grouping twice in sequence:
-  Stage 1: 196 tokens  →  ~65 groups   (1/3 compression, fixed grid adjacency)
-  Stage 2:  ~65 tokens →  ~22 groups   (1/3 compression, k-NN adjacency)
-  Total:   196 tokens  →  ~22 groups   (1/9 overall compression)
+  Stage 1: 196 tokens  →  196/target_group_size_1 groups  (fixed grid adjacency)
+  Stage 2:  G1 tokens  →  G1/target_group_size_2  groups  (k-NN adjacency)
+
+  Default (both=3.0):  196 → ~65 → ~22  (1/9 overall compression)
+  Example (4.0, 2.0):  196 → ~49 → ~25  (1/8 overall compression)
 
 Shared components (PatchEmbed, Attention, TransformerBlock, BoundaryRouter,
 GroupMerge, gpu_connected_components) are imported directly from model_asfnet
@@ -331,23 +333,25 @@ class ASFNet2(nn.Module):
 
     def __init__(
         self,
-        image_size:         int   = 224,
-        patch_size:         int   = 16,
-        in_channels:        int   = 3,
-        d_model:            int   = 256,
-        num_heads:          int   = 8,
-        encoder1_blocks:    int   = 2,
-        encoder2_blocks:    int   = 2,
-        main_blocks:        int   = 4,
-        mlp_ratio:          float = 3.0,
-        num_classes:        int   = 100,
-        target_group_size:  float = 3.0,    # both stages target 1/3 compression
-        router_proj_dim:    int   = 64,
-        knn_k:              int   = 6,      # Stage 2 neighbours per token
+        image_size:           int   = 224,
+        patch_size:           int   = 16,
+        in_channels:          int   = 3,
+        d_model:              int   = 256,
+        num_heads:            int   = 8,
+        encoder1_blocks:      int   = 2,
+        encoder2_blocks:      int   = 2,
+        main_blocks:          int   = 4,
+        mlp_ratio:            float = 3.0,
+        num_classes:          int   = 100,
+        target_group_size_1:  float = 3.0,  # Stage 1 compression: N → N/target_group_size_1
+        target_group_size_2:  float = 3.0,  # Stage 2 compression: G1 → G1/target_group_size_2
+        router_proj_dim:      int   = 64,
+        knn_k:                int   = 6,
     ):
         super().__init__()
-        self.target_group_size = target_group_size
-        self.knn_k             = knn_k
+        self.target_group_size_1 = target_group_size_1
+        self.target_group_size_2 = target_group_size_2
+        self.knn_k               = knn_k
         grid_size              = image_size // patch_size
 
         self.patch_embed = PatchEmbed(image_size, patch_size, in_channels, d_model)
@@ -399,7 +403,7 @@ class ASFNet2(nn.Module):
         for block in self.encoder1:
             tokens = block(tokens, coords)
 
-        hard1, _, l_ratio1 = self.router1(tokens, self.target_group_size)
+        hard1, _, l_ratio1 = self.router1(tokens, self.target_group_size_1)
 
         group_ids1 = gpu_connected_components(
             hard1.detach(), self.router1.edge_indices, tokens.shape[1]
@@ -423,7 +427,7 @@ class ASFNet2(nn.Module):
 
         hard2, _, l_ratio2 = self.router2(
             padded_tokens1, src2, dst2, valid2,
-            self.target_group_size, n_real1,
+            self.target_group_size_2, n_real1,
         )
 
         max_G1     = padded_tokens1.shape[1]
