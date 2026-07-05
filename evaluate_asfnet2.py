@@ -385,9 +385,7 @@ def run_accuracy(model: ASFNet2, loader, device: torch.device):
         images = images.to(device)
         labels = labels.to(device)
         out    = _get_intermediate(model, images)
-        print("mean_groups1 (from merge):", out["mean_groups1"])
-        print("unique per image, stage1:", [out["group_ids1"][i].unique().numel() for i in range(4)])
-        print("max+1 per image, stage1:", [int(out["group_ids1"][i].max()) + 1 for i in range(4)])
+
         acc1, acc5 = accuracy(out["logits"], labels, topk=(1, 5))
         top1.update(acc1, images.size(0))
         top5.update(acc5, images.size(0))
@@ -451,6 +449,11 @@ def main():
         labels = labels.to(device)
 
         out   = _get_intermediate(model, images)
+
+        print("mean_groups1 (from merge):", out["mean_groups1"])
+        print("unique per image, stage1:", [out["group_ids1"][i].unique().numel() for i in range(4)])
+        print("max+1 per image, stage1:", [int(out["group_ids1"][i].max()) + 1 for i in range(4)])
+
         preds = out["logits"].argmax(dim=1)
 
         print(f"\nFirst batch — mean Stage 1 groups: {out['mean_groups1']:.1f}  "
