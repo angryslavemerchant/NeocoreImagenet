@@ -1,4 +1,3 @@
-import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -353,7 +352,6 @@ def gpu_connected_components(
     hard: torch.Tensor,
     edge_indices: torch.Tensor,
     n_tokens: int,
-    n_iters: int = 10,
 ) -> torch.Tensor:
     """
     Finds connected components (groups of tokens with no boundary between them)
@@ -375,17 +373,18 @@ def gpu_connected_components(
       4. Labels are remapped to contiguous IDs [0, n_groups) per image using
          a sort + cumsum — both are fast GPU primitives.
 
-    Convergence: for components of size K arranged in a line (worst case
-    shape), you need K-1 iterations. With target_group_size=3, 3 iterations
-    suffices. n_iters=10 handles worst-case outliers safely for grids up to
-    28×28 without meaningfully affecting runtime since each iteration is
-    just a handful of tensor ops on small tensors.
+    Convergence: a label travels one edge per iteration, so a component whose
+    longest internal path (diameter) is K needs up to K iterations to fully
+    settle. The loop runs until no label changes anywhere in the batch, so
+    every image is guaranteed fully converged before returning — this avoids
+    the non-deterministic group splitting that a fixed iteration count caused.
+    Small groups (target_group_size≈3) converge in 2-3 iterations, so the
+    common case stays fast.
 
     Args:
         hard:         (B, E) hard boundary decisions — 1=boundary, 0=connected
         edge_indices: (E, 2) adjacency pairs, registered buffer from BoundaryRouter
         n_tokens:     N — number of tokens per image
-        n_iters:      propagation steps; 10 is safe for both 14×14 and 28×28 grids
 
     Returns:
         labels: (B, N) int64 — contiguous group IDs in [0, n_groups_per_image)
@@ -414,7 +413,19 @@ def gpu_connected_components(
     idx_i_exp = idx_i.unsqueeze(0).expand(B, -1)  # (B, E)
     idx_j_exp = idx_j.unsqueeze(0).expand(B, -1)
 
-    for _ in range(n_iters):
+    # Loop until convergence rather than a fixed count.
+    #
+    # A label travels at most one edge per iteration, so a stringy component
+    # of diameter K (longest internal path) needs up to K iterations to fully
+    # settle. On a 28×28 grid that diameter can be far larger than log2(N),
+    # so a fixed iteration count silently under-converges some images —
+    # splitting a single component into several groups on some steps but not
+    # others. That non-determinism was the source of the training jitter.
+    #
+    # n_tokens is a hard upper bound on the diameter (a path can't be longer
+    # than the token count), so this loop is guaranteed to terminate and
+    # guaranteed to fully converge every image before returning.
+    for _ in range(n_tokens):
         label_i = labels[:, idx_i]   # (B, E) — current label at each edge's source
         label_j = labels[:, idx_j]   # (B, E) — current label at each edge's dest
 
@@ -429,6 +440,14 @@ def gpu_connected_components(
         new_labels = labels.clone()
         new_labels.scatter_reduce_(1, idx_j_exp, propagate, reduce='amin', include_self=True)
         new_labels.scatter_reduce_(1, idx_i_exp, propagate, reduce='amin', include_self=True)
+
+        # Stop as soon as no label changed anywhere in the batch — the
+        # components have fully settled. This keeps the common case (small
+        # groups, converges in 2-3 iterations) fast while still handling
+        # worst-case stringy components correctly.
+        if torch.equal(new_labels, labels):
+            labels = new_labels
+            break
         labels = new_labels
 
     # --- Remap non-contiguous root labels → contiguous IDs [0, n_groups) ---
@@ -598,12 +617,6 @@ class ASFNet(nn.Module):
         self.norm       = nn.LayerNorm(d_model)
         self.classifier = nn.Linear(d_model, num_classes)
 
-        # n_iters for label propagation: log2(n_tokens) guarantees convergence
-        # for any component size. For target_group_size=3, ~3 iters suffice;
-        # this just handles worst-case outliers without meaningfully affecting speed.
-        n_tokens   = (image_size // patch_size) ** 2
-        self._cc_iters = max(int(math.ceil(math.log2(n_tokens))), 4)
-
     def forward(
         self,
         x: torch.Tensor,
@@ -628,7 +641,6 @@ class ASFNet(nn.Module):
             hard.detach(),
             self.router.edge_indices,
             tokens.shape[1],
-            n_iters=self._cc_iters,
         )
 
         padded_tokens, padded_coords, pad_mask, mean_groups = self.group_merge(
