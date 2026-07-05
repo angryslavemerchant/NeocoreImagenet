@@ -463,6 +463,7 @@ class ASFNet2(nn.Module):
         ids2_clamped    = group_ids2.clamp(0, max_G2 - 1)
         real2_sum.scatter_add_(1, ids2_clamped, real1)
         pad_mask2 = real2_sum < 0.5                        # (B, max_G2)
+        mean_groups2 = float((~pad_mask2).sum(dim=1).float().mean().item())
 
         # ---- Main network + classifier ----
         for block in self.main_net:
