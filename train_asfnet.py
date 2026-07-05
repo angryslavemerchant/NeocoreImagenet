@@ -266,6 +266,9 @@ def main():
     train_loader, val_loader = get_dataloaders(args)
 
     model = build_model(args).to(device)
+
+    torch.compile(model)
+
     param_counts = model.count_parameters()
     print("\nParameter counts:")
     for name, count in param_counts.items():
