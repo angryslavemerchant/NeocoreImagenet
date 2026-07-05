@@ -332,11 +332,6 @@ class BoundaryRouter(nn.Module):
         hard = (probs > 0.5).float() + probs - probs.detach()    # (B, E)
 
         # --- Ratio loss ---
-        # F = hard boundary rate — non-differentiable, used as a diagnostic signal
-        # G = mean soft boundary probability — differentiable, this is the gradient dial
-        # Coupling: if too many hard boundaries fire (F > 1/N_target), gradient on G
-        # pushes it down → router produces fewer boundaries next step. And vice versa.
-        # Formula adapted from H-Net; minimum is at F = G = 1 / target_group_size.
         N = target_group_size
         F_rate = hard.detach().mean(dim=-1)   # (B,) — per-image hard boundary rate
         G_rate = probs.mean(dim=-1)           # (B,) — per-image mean soft probability
@@ -402,20 +397,26 @@ def find_groups(
     edge_indices: (E, 2)
 
     Returns list of B group-assignment lists, each of length n_tokens.
-    The grid is small (196 tokens, 364 edges) so the Python loop is fast.
     """
-    edges     = edge_indices.tolist()
-    hard_list = hard.cpu().tolist()    # detach happens at call site in ASFNet.forward
+    from concurrent.futures import ThreadPoolExecutor
 
-    return [
-        _union_find(n_tokens, edges, hard_list[b])
-        for b in range(hard.shape[0])
-    ]
+    edges     = edge_indices.tolist()
+    hard_list = hard.cpu().tolist()
+
+    with ThreadPoolExecutor() as pool:
+        results = list(pool.map(
+            lambda b_hard: _union_find(n_tokens, edges, b_hard),
+            hard_list,
+        ))
+    return results
 
 
 # ---------------------------------------------------------------------------
 # Group Merging + Projection
 # ---------------------------------------------------------------------------
+
+_GROUP_STRIDE = 1000  # max possible groups per image — must exceed worst case (all tokens)
+
 
 class GroupMerge(nn.Module):
     """
@@ -427,8 +428,10 @@ class GroupMerge(nn.Module):
     Token position: mean of constituent (row, col) coordinates
                     (not differentiable — only used for RoPE in the main network)
 
-    Sequences are padded to the batch-maximum group count so downstream transformer
-    blocks can process the whole batch in one forward pass.
+    Vectorized: group IDs are made globally unique across the batch by adding a
+    fixed per-image offset (_GROUP_STRIDE * image_index). This lets a single
+    scatter_add_ across all B*N tokens replace the original per-image Python loop,
+    eliminating the CPU bottleneck that slows training at large batch sizes.
     """
 
     def __init__(self, d_model: int):
@@ -453,52 +456,53 @@ class GroupMerge(nn.Module):
             mean_groups:   float — avg group count across batch (diagnostic)
         """
         B, N, D = h.shape
-        device   = h.device
+        device  = h.device
 
-        batch_feats:  list[torch.Tensor] = []
-        batch_coords: list[torch.Tensor] = []
+        # (B, N) — raw group ids, unique only within each image
+        group_ids = torch.tensor(all_groups, device=device, dtype=torch.long)
 
-        for b in range(B):
-            group_ids = torch.tensor(all_groups[b], device=device, dtype=torch.long)  # (N,)
-            n_groups  = int(group_ids.max().item()) + 1
+        # Number of groups per image: max id + 1
+        n_groups_per_image = group_ids.max(dim=1).values + 1  # (B,)
 
-            # --- Differentiable mean pool of features ---
-            feat_sum = torch.zeros(n_groups, D, device=device, dtype=h.dtype)
-            counts   = torch.zeros(n_groups, device=device, dtype=h.dtype)
-            feat_sum.scatter_add_(0, group_ids.unsqueeze(-1).expand(-1, D), h[b])
-            counts.scatter_add_(0, group_ids, torch.ones(N, device=device, dtype=h.dtype))
-            group_feats = feat_sum / counts.unsqueeze(-1)              # (n_groups, D)
+        # Make group ids globally unique by shifting each image by _GROUP_STRIDE.
+        # Image 0: ids stay as-is. Image 1: ids += 1000. Image 2: ids += 2000. Etc.
+        offsets    = torch.arange(B, device=device, dtype=torch.long) * _GROUP_STRIDE
+        global_ids = group_ids + offsets.unsqueeze(1)  # (B, N)
 
-            # --- Mean pool coordinates (no grad needed — only used for RoPE) ---
-            with torch.no_grad():
-                coord_sum = torch.zeros(n_groups, 2, device=device)
-                coord_sum.scatter_add_(
-                    0,
-                    group_ids.unsqueeze(-1).expand(-1, 2),
-                    coords.float(),
-                )
-                group_coords = coord_sum / counts.float().unsqueeze(-1)  # (n_groups, 2)
+        # Flatten to (B*N,) so one scatter_add_ handles the whole batch at once
+        flat_h   = h.reshape(B * N, D)
+        flat_ids = global_ids.reshape(B * N)
 
-            batch_feats.append(group_feats)
-            batch_coords.append(group_coords)
+        # Accumulate feature sums and token counts into (B*_GROUP_STRIDE,) buckets
+        feat_sum = torch.zeros(B * _GROUP_STRIDE, D, device=device, dtype=h.dtype)
+        counts   = torch.zeros(B * _GROUP_STRIDE,    device=device, dtype=h.dtype)
+        feat_sum.scatter_add_(0, flat_ids.unsqueeze(-1).expand(-1, D), flat_h)
+        counts.scatter_add_(0, flat_ids, torch.ones(B * N, device=device, dtype=h.dtype))
 
-        # --- Pad to max group count in this batch ---
-        group_sizes = [f.shape[0] for f in batch_feats]
-        max_G       = max(group_sizes)
-        mean_groups = sum(group_sizes) / B
+        # Divide to get mean features; clamp avoids divide-by-zero on empty slots
+        group_feats = (feat_sum / counts.unsqueeze(-1).clamp(min=1)).view(B, _GROUP_STRIDE, D)
 
-        padded_tokens = torch.zeros(B, max_G, D, device=device, dtype=h.dtype)
-        padded_coords = torch.zeros(B, max_G, 2, device=device, dtype=torch.float32)
-        pad_mask      = torch.ones(B, max_G, device=device, dtype=torch.bool)
+        # Slice down to the largest actual group count in this batch
+        max_G         = int(n_groups_per_image.max().item())
+        padded_tokens = self.proj(group_feats[:, :max_G, :])  # (B, max_G, D)
 
-        for b, (feats, crds, G) in enumerate(zip(batch_feats, batch_coords, group_sizes)):
-            padded_tokens[b, :G] = feats
-            padded_coords[b, :G] = crds
-            pad_mask[b, :G]      = False   # True = padding, False = real token
+        # Pad mask: True = padding slot, False = real group token
+        # arange (1, max_G) broadcast against n_groups_per_image (B, 1)
+        arange   = torch.arange(max_G, device=device).unsqueeze(0)  # (1, max_G)
+        pad_mask = arange >= n_groups_per_image.unsqueeze(1)         # (B, max_G)
 
-        # Single batched projection — applied to padding tokens too but they're masked downstream
-        padded_tokens = self.proj(padded_tokens)
+        # Coords — same scatter logic, no grad needed
+        with torch.no_grad():
+            coord_sum = torch.zeros(B * _GROUP_STRIDE, 2, device=device)
+            coord_sum.scatter_add_(
+                0,
+                flat_ids.unsqueeze(-1).expand(-1, 2),
+                coords.unsqueeze(0).expand(B, -1, -1).reshape(B * N, 2).float(),
+            )
+            group_coords  = (coord_sum / counts.float().unsqueeze(-1).clamp(min=1)).view(B, _GROUP_STRIDE, 2)
+            padded_coords = group_coords[:, :max_G, :]  # (B, max_G, 2)
 
+        mean_groups = float(n_groups_per_image.float().mean().item())
         return padded_tokens, padded_coords, pad_mask, mean_groups
 
 
@@ -586,8 +590,6 @@ class ASFNet(nn.Module):
         hard, probs, l_ratio = self.router(tokens, self.target_group_size)
 
         # Stage 4: Connected components — group assignments per image
-        # hard is detached here: CC step is non-differentiable.
-        # Gradients reach the router only through l_ratio → probs → W_q, W_k.
         all_groups = find_groups(
             hard.detach(),
             self.router.edge_indices,
@@ -598,13 +600,8 @@ class ASFNet(nn.Module):
         padded_tokens, padded_coords, pad_mask, mean_groups = self.group_merge(
             tokens, coords, all_groups
         )
-        # padded_tokens: (B, max_G, D)
-        # padded_coords: (B, max_G, 2) — per-image fractional centroid coords
-        # pad_mask:      (B, max_G)    — True = padding
 
         # Stage 6: Main network — reason over compressed tokens
-        # padded_coords is (B, max_G, 2): apply_rope_2d handles the per-image case.
-        # pad_mask prevents attention to padding tokens.
         for block in self.main_net:
             padded_tokens = block(padded_tokens, padded_coords, pad_mask)
 
