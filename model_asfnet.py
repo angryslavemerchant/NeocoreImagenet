@@ -550,10 +550,17 @@ class GroupMerge(nn.Module):
 
         with torch.no_grad():
             coord_sum = torch.zeros(B * _GROUP_STRIDE, 2, device=device)
+            # coords is (N, 2) at Stage 1 (shared patch grid, same for every image)
+            # but (B, N, 2) at Stage 2 (per-image fractional group centroids).
+            # Handle both cases before flattening to (B*N, 2) for scatter_add_.
+            if coords.dim() == 2:
+                coords_flat = coords.unsqueeze(0).expand(B, -1, -1).reshape(B * N, 2).float()
+            else:
+                coords_flat = coords.reshape(B * N, 2).float()
             coord_sum.scatter_add_(
                 0,
                 flat_ids.unsqueeze(-1).expand(-1, 2),
-                coords.unsqueeze(0).expand(B, -1, -1).reshape(B * N, 2).float(),
+                coords_flat,
             )
             group_coords  = (coord_sum / counts.float().unsqueeze(-1).clamp(min=1)).view(B, _GROUP_STRIDE, 2)
             padded_coords = group_coords[:, :max_G, :]  # (B, max_G, 2)
