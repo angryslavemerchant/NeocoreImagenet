@@ -253,7 +253,8 @@ def main():
     if args.run_name is None:
         args.run_name = (
             f"ASFNet2_D{args.d_model}"
-            f"_enc{args.encoder1_blocks}-{args.encoder2_blocks}"
+            f"_enc{args.local_encoder1}-{args.local_radius}"
+            f"_loc{args.encoder1_blocks}-{args.encoder2_blocks}"
             f"_main{args.main_blocks}"
             f"_N{args.target_group_size_1}-{args.target_group_size_2}"
             f"_k{args.knn_k}_p{args.patch_size}"
