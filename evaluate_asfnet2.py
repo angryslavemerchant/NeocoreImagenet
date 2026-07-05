@@ -97,7 +97,8 @@ def _get_intermediate(
         mean_groups1    float
         mean_groups2    float        — corrected (excludes leaked padding groups)
     """
-    with torch.no_grad():
+    with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+
         B = images.shape[0]
 
         # ---- Stage 1 ----
