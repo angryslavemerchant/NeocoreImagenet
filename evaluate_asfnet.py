@@ -59,7 +59,9 @@ def _load_model_from_checkpoint(path: str, device: torch.device) -> tuple[ASFNet
         target_group_size = args["target_group_size"],
         router_proj_dim   = args["router_proj_dim"],
     )
-    model.load_state_dict(ckpt["model"])
+    state_dict = ckpt["model"]
+    state_dict = {k.replace("_orig_mod.", "", 1): v for k, v in state_dict.items()}
+    model.load_state_dict(state_dict)
     model.to(device)
     model.eval()
 
