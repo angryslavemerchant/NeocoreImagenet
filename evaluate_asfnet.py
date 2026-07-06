@@ -1,17 +1,20 @@
 """
 evaluate_asfnet.py — ASFNet evaluation and group visualisation
 
-Two modes:
+Three modes (any can be combined):
   --visualize N   Save N side-by-side images showing how the router
                   chunked the image into groups. Each patch cell is
                   coloured by its group ID; boundary edges are drawn
                   as white lines. Quick way to sanity-check that the
                   router is doing something sensible.
 
+  --bin_by_groups Run the full validation set and report accuracy binned
+                  by group count. Single-stage analogue of the two-stage
+                  diagnostic in evaluate_asfnet2.py — tests whether images
+                  compressed to few groups classify worse (or better).
+
   (no flag)       Just run accuracy over the full validation set and
                   print top-1 / top-5.
-
-Both modes can be combined.
 """
 
 import os
@@ -80,6 +83,16 @@ def _get_intermediate(
     Calls each submodule manually in the same order as ASFNet.forward(), so
     this is guaranteed to stay in sync as long as the architecture doesn't change.
 
+    IMPORTANT — bfloat16 autocast:
+        The forward pass is wrapped in bfloat16 autocast to match the training
+        precision. The router's hard boundary decision is a 0.5 threshold that
+        was calibrated under bfloat16 during training; running this in float32
+        shifts borderline edges and inflates the group count dramatically
+        (observed ~150 groups instead of the real ~37). This mirrors
+        evaluate_asfnet2._get_intermediate and is what makes the group counts
+        here comparable to the two-stage run and to the training-time
+        mean_groups. Do not remove the autocast context.
+
     Returns:
         logits:     (B, num_classes)
         group_ids:  (B, N) int64   — contiguous group IDs, same as inside forward()
@@ -87,7 +100,7 @@ def _get_intermediate(
         tokens:     (B, N, D)      — encoder output (pre-merge), for diagnostics
         mean_groups: float
     """
-    with torch.no_grad():
+    with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
         tokens, coords = model.patch_embed(images)
 
         for block in model.encoder:
@@ -340,12 +353,109 @@ def run_accuracy(model: ASFNet, loader, device: torch.device, args_dict: dict):
         images = images.to(device)
         labels = labels.to(device)
         logits, _, _, _, _ = _get_intermediate(model, images)
-        acc1, acc5 = accuracy(logits, labels, topk=(1, 5))
+        acc1, acc5 = accuracy(logits.float(), labels, topk=(1, 5))
         top1.update(acc1, images.size(0))
         top5.update(acc5, images.size(0))
 
     print(f"\nTop-1: {top1.avg:.2f}%  |  Top-5: {top5.avg:.2f}%")
     return top1.avg, top5.avg
+
+
+# ---------------------------------------------------------------------------
+# Accuracy binned by group count
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def accuracy_by_group_count(
+    model:   ASFNet,
+    loader,
+    device:  torch.device,
+    n_bins:  int = 6,
+):
+    """
+    Single-stage analogue of evaluate_asfnet2.accuracy_by_group_count.
+
+    Tests whether images the router compresses to few groups also classify
+    worse (or better).
+
+    For every validation image, records two numbers:
+      - its group count (how many groups the router compressed the N patches
+        into — fewer means the router merged more aggressively, which happens
+        on images with large uniform regions)
+      - whether the top-1 prediction was correct
+
+    Then splits the images into equal-width bins by group count and reports
+    accuracy within each bin, plus a median-split gap. A negative gap (fewer
+    groups → lower accuracy) means aggressive compression is destroying
+    information the classifier needed; a flat profile means grouping quality is
+    not the accuracy bottleneck.
+
+    Note: relies on the bfloat16 autocast inside _get_intermediate so the group
+    counts match training. See the warning in that function.
+
+    Args:
+        n_bins: how many group-count buckets to split the range into.
+    """
+    counts  = []   # per-image group count
+    correct = []   # per-image 1 if top-1 correct else 0
+
+    for images, labels in tqdm(loader, desc="Binning by group count"):
+        images = images.to(device)
+        labels = labels.to(device)
+
+        logits, group_ids, _, _, _ = _get_intermediate(model, images)
+
+        # group_ids are contiguous per image in [0, n_groups), so the per-image
+        # group count is (max + 1) — the same convention the visualiser uses.
+        per_image_counts = group_ids.max(dim=1).values + 1        # (B,)
+        preds            = logits.argmax(dim=1)                   # (B,)
+        is_correct       = (preds == labels).long()              # (B,)
+
+        counts.append(per_image_counts.cpu())
+        correct.append(is_correct.cpu())
+
+    counts  = torch.cat(counts).numpy()
+    correct = torch.cat(correct).numpy()
+
+    overall = 100.0 * correct.mean()
+    lo, hi  = int(counts.min()), int(counts.max())
+
+    print(f"\nOverall top-1: {overall:.2f}%  "
+          f"({len(counts)} images, group count range {lo}–{hi})")
+    print(f"\n{'group count':>14} | {'images':>7} | {'accuracy':>9} | {'mean groups':>11}")
+    print("-" * 52)
+
+    # Equal-width bins across the observed group-count range
+    edges = np.linspace(lo, hi + 1e-6, n_bins + 1)
+    for b in range(n_bins):
+        in_bin = (counts >= edges[b]) & (counts < edges[b + 1])
+        n      = int(in_bin.sum())
+        if n == 0:
+            print(f"{int(edges[b]):>6}–{int(edges[b+1]):<6} |"
+                  f" {0:>7} | {'—':>9} | {'—':>11}")
+            continue
+        acc      = 100.0 * correct[in_bin].mean()
+        mean_grp = counts[in_bin].mean()
+        print(f"{int(edges[b]):>6}–{int(edges[b+1]):<6} |"
+              f" {n:>7} | {acc:>8.2f}% | {mean_grp:>11.1f}")
+
+    # Simple correlation summary: split at the median and compare halves.
+    # A clear gap here is the headline result.
+    median    = np.median(counts)
+    low_half  = counts <= median
+    high_half = counts >  median
+    if low_half.sum() > 0 and high_half.sum() > 0:
+        acc_low  = 100.0 * correct[low_half].mean()
+        acc_high = 100.0 * correct[high_half].mean()
+        print("-" * 52)
+        print(f"Fewer groups than median ({median:.0f}): {acc_low:.2f}%  "
+              f"({int(low_half.sum())} imgs)")
+        print(f"More groups than median  ({median:.0f}): {acc_high:.2f}%  "
+              f"({int(high_half.sum())} imgs)")
+        print(f"Gap: {acc_low - acc_high:+.2f} percentage points "
+              f"(positive = cleanly-compressed images classify better)")
+
+    return counts, correct
 
 
 # ---------------------------------------------------------------------------
@@ -364,6 +474,12 @@ def main():
     parser.add_argument("--no_accuracy",  action="store_true",
                         help="Skip the full accuracy evaluation loop — useful when you just "
                              "want quick visualisations without waiting for the full val pass.")
+    parser.add_argument("--bin_by_groups", action="store_true",
+                        help="Run the full validation set and report accuracy binned by "
+                             "group count. Tests whether cleanly-compressed (few-group) "
+                             "images also classify better or worse.")
+    parser.add_argument("--n_bins",       type=int, default=6,
+                        help="Number of group-count buckets for --bin_by_groups.")
     parser.add_argument("--output_dir",   type=str, default="./viz_asfnet",
                         help="Directory to save visualisation images.")
     parser.add_argument("--alpha",        type=float, default=0.55,
@@ -405,6 +521,9 @@ def main():
 
     if not args.no_accuracy:
         run_accuracy(model, val_loader, device, ckpt_args)
+
+    if args.bin_by_groups:
+        accuracy_by_group_count(model, val_loader, device, n_bins=args.n_bins)
 
     if args.visualize > 0 or args.grid:
         os.makedirs(args.output_dir, exist_ok=True)
