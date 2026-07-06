@@ -267,7 +267,7 @@ def main():
 
     model = build_model(args).to(device)
 
-    torch.compile(model)
+    model = torch.compile(model)
 
     param_counts = model.count_parameters()
     print("\nParameter counts:")
