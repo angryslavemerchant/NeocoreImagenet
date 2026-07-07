@@ -30,7 +30,7 @@ import numpy as np
 from tqdm import tqdm
 
 from dataset import get_dataloaders, IMAGENET_MEAN, IMAGENET_STD
-from model_asfnet import ASFNet, gpu_connected_components
+from model_asfnet import *
 from utils import AverageMeter, accuracy
 
 
@@ -58,6 +58,8 @@ def _load_model_from_checkpoint(path: str, device: torch.device) -> tuple[ASFNet
         num_classes       = args["num_classes"],
         target_group_size = args["target_group_size"],
         router_proj_dim   = args["router_proj_dim"],
+        weighted_merge=args.get("weighted_merge", False),
+        merge_beta=args.get("merge_beta", 2.0),
     )
     state_dict = ckpt["model"]
     state_dict = {k.replace("_orig_mod.", "", 1): v for k, v in state_dict.items()}
@@ -116,8 +118,14 @@ def _get_intermediate(
             tokens.shape[1],
         )
 
+        token_weights = None
+        if getattr(model, "weighted_merge", False):
+            token_weights = edge_probs_to_token_weights(
+                probs, model.router.edge_indices, tokens.shape[1], model.merge_beta,
+            )
+
         padded_tokens, padded_coords, pad_mask, mean_groups = model.group_merge(
-            tokens, coords, group_ids
+            tokens, coords, group_ids, token_weights=token_weights,
         )
 
         for block in model.main_net:

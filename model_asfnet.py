@@ -800,6 +800,26 @@ def gpu_connected_components(
 _GROUP_STRIDE = 1000
 
 
+def edge_probs_to_token_weights(
+    probs:        torch.Tensor,   # (B, E) soft boundary probs from the router
+    edge_indices: torch.Tensor,   # (E, 2) grid edge (i, j) pairs (router buffer)
+    n_tokens:     int,            # N tokens per image (196 at Stage 1)
+    beta:         float,          # contrast knob; 1-2 typical
+) -> torch.Tensor:
+    """
+    w_m = exp(-beta * s_m), where s_m is the sum of boundary probabilities on
+    token m's incident edges. Differentiable in `probs`
+    (dw/dprobs[e] = -beta*w on each incident edge) — this is the gradient wire
+    from the classification loss back to the router projections. Returns (B, N).
+    """
+    idx_i = edge_indices[:, 0]
+    idx_j = edge_indices[:, 1]
+    s = probs.new_zeros(probs.shape[0], n_tokens)   # (B, N)
+    s = s.index_add(1, idx_i, probs)                # accumulate onto endpoint i
+    s = s.index_add(1, idx_j, probs)                # and endpoint j
+    return torch.exp(-beta * s)                     # (B, N)
+
+
 class GroupMerge(nn.Module):
     """
     Merges each connected-component group into a single token via mean pooling,
@@ -896,7 +916,7 @@ class ASFNet(nn.Module):
       → encoder_blocks × TransformerBlock build semantic representations
       → BoundaryRouter                    score every adjacent pair
       → gpu_connected_components          label propagation entirely on GPU
-      → GroupMerge                        mean-pool + project → adaptive token count
+      → GroupMerge                        (weighted) pool + project → adaptive token count
       → main_blocks × TransformerBlock    reason over compressed token set
       → masked Global Average Pool
       → Linear classifier
@@ -915,6 +935,8 @@ class ASFNet(nn.Module):
         num_classes:       int   = 100,
         target_group_size: float = 3.0,
         router_proj_dim:   int   = 64,
+        weighted_merge:    bool  = False,
+        merge_beta:        float = 2.0,
     ):
         super().__init__()
         self.target_group_size = target_group_size
@@ -937,6 +959,9 @@ class ASFNet(nn.Module):
 
         self.norm       = nn.LayerNorm(d_model)
         self.classifier = nn.Linear(d_model, num_classes)
+
+        self.weighted_merge = weighted_merge
+        self.merge_beta     = merge_beta
 
     def forward(
         self,
@@ -964,8 +989,14 @@ class ASFNet(nn.Module):
             tokens.shape[1],
         )
 
+        token_weights = None
+        if self.weighted_merge:
+            token_weights = edge_probs_to_token_weights(
+                probs, self.router.edge_indices, tokens.shape[1], self.merge_beta,
+            )
+
         padded_tokens, padded_coords, pad_mask, mean_groups = self.group_merge(
-            tokens, coords, group_ids,
+            tokens, coords, group_ids, token_weights=token_weights,
         )
 
         for block in self.main_net:

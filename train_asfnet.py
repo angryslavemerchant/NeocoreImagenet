@@ -11,7 +11,7 @@ from torch.cuda.amp import GradScaler
 from tqdm import tqdm
 
 from dataset import get_dataloaders
-from model_asfnet import ASFNet
+from model_asfnet import *
 from utils import AverageMeter, accuracy
 
 
@@ -43,6 +43,8 @@ def build_model(args) -> ASFNet:
         num_classes       = args.num_classes,
         target_group_size = args.target_group_size,
         router_proj_dim   = args.router_proj_dim,
+        weighted_merge    = args.weighted_merge,
+        merge_beta        = args.merge_beta,
     )
 
 
@@ -218,6 +220,12 @@ def main():
     parser.add_argument("--target_group_size", type=float, default=3.0)
     parser.add_argument("--router_proj_dim",   type=int,   default=64)
 
+    parser.add_argument("--weighted_merge", action="store_true",
+                        help="Confidence-weighted GroupMerge: puts router probs on the "
+                             "gradient path to the loss. Default off = original mean pool.")
+    parser.add_argument("--merge_beta", type=float, default=2.0,
+                        help="Contrast for weighted merge: w = exp(-beta*s). 1-2 typical.")
+
     # --- Training ---
     parser.add_argument("--batch_size",        type=int,   default=1024)
     parser.add_argument("--num_epochs",        type=int,   default=90)
@@ -255,6 +263,9 @@ def main():
             f"D{args.d_model}_enc{args.encoder_blocks}_main{args.main_blocks}"
             f"_N{args.target_group_size}_mlp{args.mlp_ratio}_p{args.patch_size}"
         )
+
+    if args.weighted_merge:
+        args.run_name += f"_wmerge{args.merge_beta}"
 
     wandb.init(
         project = args.wandb_project,
