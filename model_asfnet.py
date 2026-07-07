@@ -822,15 +822,17 @@ def edge_probs_to_token_weights(
 
 class GroupMerge(nn.Module):
     """
-    Merges each connected-component group into a single token via mean pooling,
-    then applies a linear projection.
+    Merges each connected-component group into a single token, then projects.
 
-    Accepts a (B, N) integer tensor of contiguous group IDs directly from
-    gpu_connected_components — no Python loops, no CPU involvement.
+    Uniform mean when `token_weights is None` (original behaviour, unchanged).
+    Confidence-weighted mean when `token_weights` (B, N) is supplied — this is
+    what puts the router's soft `probs` on the differentiable path to the logits.
 
     Vectorized via a fixed-stride offset trick: image b's group IDs are shifted
-    by b * _GROUP_STRIDE so all B*N tokens can be processed in a single
-    scatter_add_ call instead of B separate ones.
+    by b * _GROUP_STRIDE so all B*N tokens go through one scatter_add_ call.
+
+    `token_weights=None` default keeps every existing caller — including the
+    two-stage merge1/merge2 calls in model_asfnet2.py — working unchanged.
     """
 
     def __init__(self, d_model: int):
@@ -842,11 +844,13 @@ class GroupMerge(nn.Module):
         h: torch.Tensor,
         coords: torch.Tensor,
         group_ids: torch.Tensor,
+        token_weights: torch.Tensor = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, float]:
         """
-        h:         (B, N, D) encoder hidden states
-        coords:    (N, 2)    patch grid coordinates
-        group_ids: (B, N)    contiguous group IDs from gpu_connected_components
+        h:             (B, N, D) encoder hidden states
+        coords:        (N, 2) Stage 1 grid  |  (B, N, 2) Stage 2 centroids
+        group_ids:     (B, N) contiguous group IDs from gpu_connected_components
+        token_weights: (B, N) per-token merge weights, or None for uniform mean
 
         Returns:
             padded_tokens: (B, max_G, D)
@@ -859,34 +863,44 @@ class GroupMerge(nn.Module):
 
         n_groups_per_image = group_ids.max(dim=1).values + 1  # (B,)
 
-        # Make group IDs globally unique across the batch to enable a single
-        # scatter_add_ call for all B*N tokens at once.
         offsets    = torch.arange(B, device=device, dtype=torch.long) * _GROUP_STRIDE
         global_ids = group_ids + offsets.unsqueeze(1)  # (B, N)
 
         flat_h   = h.reshape(B * N, D)
         flat_ids = global_ids.reshape(B * N)
 
-        feat_sum = torch.zeros(B * _GROUP_STRIDE, D, device=device, dtype=h.dtype)
-        counts   = torch.zeros(B * _GROUP_STRIDE,    device=device, dtype=h.dtype)
-        feat_sum.scatter_add_(0, flat_ids.unsqueeze(-1).expand(-1, D), flat_h)
+        # counts is always needed: the coordinate centroid is an UNWEIGHTED mean.
+        counts = torch.zeros(B * _GROUP_STRIDE, device=device, dtype=h.dtype)
         counts.scatter_add_(0, flat_ids, torch.ones(B * N, device=device, dtype=h.dtype))
 
-        group_feats = (feat_sum / counts.unsqueeze(-1).clamp(min=1)).view(B, _GROUP_STRIDE, D)
+        if token_weights is None:
+            # ---- uniform mean (original behaviour) ----
+            feat_sum = torch.zeros(B * _GROUP_STRIDE, D, device=device, dtype=h.dtype)
+            feat_sum.scatter_add_(0, flat_ids.unsqueeze(-1).expand(-1, D), flat_h)
+            group_feats = (feat_sum / counts.unsqueeze(-1).clamp(min=1)).view(B, _GROUP_STRIDE, D)
+        else:
+            # ---- confidence-weighted mean: probs enters the graph here ----
+            flat_w = token_weights.reshape(B * N).to(h.dtype)
+            wsum   = torch.zeros(B * _GROUP_STRIDE, device=device, dtype=h.dtype)
+            wsum.scatter_add_(0, flat_ids, flat_w)
+            feat_sum = torch.zeros(B * _GROUP_STRIDE, D, device=device, dtype=h.dtype)
+            feat_sum.scatter_add_(
+                0,
+                flat_ids.unsqueeze(-1).expand(-1, D),
+                flat_h * flat_w.unsqueeze(-1),
+            )
+            # wsum > 0 for every real group (exp is positive); the clamp only
+            # guards empty stride slots, which are masked out below.
+            group_feats = (feat_sum / wsum.unsqueeze(-1).clamp(min=1e-6)).view(B, _GROUP_STRIDE, D)
 
         max_G         = int(n_groups_per_image.max().item())
         padded_tokens = self.proj(group_feats[:, :max_G, :])  # (B, max_G, D)
 
-        # Pad mask: True = padding slot, False = real group.
-        # Broadcasting comparison — no loop needed.
         arange   = torch.arange(max_G, device=device).unsqueeze(0)  # (1, max_G)
         pad_mask = arange >= n_groups_per_image.unsqueeze(1)         # (B, max_G)
 
         with torch.no_grad():
             coord_sum = torch.zeros(B * _GROUP_STRIDE, 2, device=device)
-            # coords is (N, 2) at Stage 1 (shared patch grid, same for every image)
-            # but (B, N, 2) at Stage 2 (per-image fractional group centroids).
-            # Handle both cases before flattening to (B*N, 2) for scatter_add_.
             if coords.dim() == 2:
                 coords_flat = coords.unsqueeze(0).expand(B, -1, -1).reshape(B * N, 2).float()
             else:
@@ -901,7 +915,6 @@ class GroupMerge(nn.Module):
 
         mean_groups = float(n_groups_per_image.float().mean().item())
         return padded_tokens, padded_coords, pad_mask, mean_groups
-
 
 # ---------------------------------------------------------------------------
 # ASFNet
