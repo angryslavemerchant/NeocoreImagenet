@@ -121,7 +121,7 @@ def _get_intermediate(
         token_weights = None
         if getattr(model, "weighted_merge", False):
             token_weights = edge_probs_to_token_weights(
-                probs, model.router.edge_indices, tokens.shape[1], model.merge_beta,
+                probs, hard, model.router.edge_indices, tokens.shape[1],
             )
 
         padded_tokens, padded_coords, pad_mask, mean_groups = model.group_merge(

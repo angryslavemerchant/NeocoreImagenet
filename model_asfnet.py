@@ -801,23 +801,39 @@ _GROUP_STRIDE = 1000
 
 
 def edge_probs_to_token_weights(
-    probs:        torch.Tensor,   # (B, E) soft boundary probs from the router
-    edge_indices: torch.Tensor,   # (E, 2) grid edge (i, j) pairs (router buffer)
-    n_tokens:     int,            # N tokens per image (196 at Stage 1)
-    beta:         float,          # contrast knob; 1-2 typical
+    probs:        torch.Tensor,   # (B, E) soft boundary probs
+    hard:         torch.Tensor,   # (B, E) hard boundary decisions (0/1)
+    edge_indices: torch.Tensor,   # (E, 2)
+    n_tokens:     int,
 ) -> torch.Tensor:
     """
-    w_m = exp(-beta * s_m), where s_m is the sum of boundary probabilities on
-    token m's incident edges. Differentiable in `probs`
-    (dw/dprobs[e] = -beta*w on each incident edge) — this is the gradient wire
-    from the classification loss back to the router projections. Returns (B, N).
+    Border-ONLY, boundary-biased, linear merge weights.
+
+    A token is 'border' if any incident edge is a cut (hard=1). Interior tokens
+    get weight 0 → dropped from the pool entirely. Border tokens get weight
+    w = s = sum of their incident edge probabilities, so higher boundary
+    probability → higher weight. Gradient to `probs` flows through every border
+    token (dw/dprobs = 1 on each incident edge); interior tokens carry none.
+
+    No beta: the weight is linear in the boundary probability.
+    Returns (B, N).
     """
-    idx_i = edge_indices[:, 0]
-    idx_j = edge_indices[:, 1]
-    s = probs.new_zeros(probs.shape[0], n_tokens)   # (B, N)
-    s = s.index_add(1, idx_i, probs)                # accumulate onto endpoint i
-    s = s.index_add(1, idx_j, probs)                # and endpoint j
-    return torch.exp(-beta * s)                     # (B, N)
+    idx_i, idx_j = edge_indices[:, 0], edge_indices[:, 1]
+
+    # s_m: soft boundary evidence per token (differentiable in probs)
+    s = probs.new_zeros(probs.shape[0], n_tokens)
+    s = s.index_add(1, idx_i, probs)
+    s = s.index_add(1, idx_j, probs)
+
+    # is_border_m: does the token touch any cut edge? (from hard, detached —
+    # a routing fact, not a gradient path)
+    hb = hard.detach()
+    border = probs.new_zeros(probs.shape[0], n_tokens)
+    border = border.index_add(1, idx_i, hb)
+    border = border.index_add(1, idx_j, hb)
+    is_border = (border > 0.5).to(probs.dtype)          # (B, N) 1=border, 0=interior
+
+    return s * is_border                                 # (B, N)
 
 
 class GroupMerge(nn.Module):
@@ -1005,7 +1021,7 @@ class ASFNet(nn.Module):
         token_weights = None
         if self.weighted_merge:
             token_weights = edge_probs_to_token_weights(
-                probs, self.router.edge_indices, tokens.shape[1], self.merge_beta,
+                probs, hard, self.router.edge_indices, tokens.shape[1],
             )
 
         padded_tokens, padded_coords, pad_mask, mean_groups = self.group_merge(
