@@ -30,13 +30,8 @@ import numpy as np
 from tqdm import tqdm
 
 from dataset import get_dataloaders, IMAGENET_MEAN, IMAGENET_STD
-from model_asfnet2 import (
-    ASFNet2,
-    build_knn_edges,
-    knn_edges_to_mask,
-    gpu_connected_components_dynamic,
-)
-from model_asfnet import gpu_connected_components
+from model_asfnet2 import *
+from model_asfnet import *
 from utils import AverageMeter, accuracy
 
 
@@ -67,6 +62,8 @@ def _load_model(path: str, device: torch.device) -> tuple[ASFNet2, dict]:
         local_radius        = a.get("local_radius", 1),
         local_encoder2      = a.get("local_encoder2", False),
         local_encoder2_safe = a.get("local_encoder2_safe", False),
+        weighted_merge=a.get("weighted_merge", False),
+        # ... plus the local_* flags already there, unchanged
     )
     model.load_state_dict(ckpt["model"])
     model.to(device).eval()
@@ -110,12 +107,19 @@ def _get_intermediate(
         for block in model.encoder1:
             tokens = block(tokens, coords)
 
-        hard1, _, _ = model.router1(tokens, model.target_group_size_1)
-        group_ids1  = gpu_connected_components(
+        hard1, probs1, _ = model.router1(tokens, model.target_group_size_1)
+        group_ids1 = gpu_connected_components(
             hard1.detach(), model.router1.edge_indices, tokens.shape[1]
         )
+
+        token_weights1 = None
+        if getattr(model, "weighted_merge", False):
+            token_weights1 = edge_probs_to_token_weights(
+                probs1, hard1, model.router1.edge_indices, tokens.shape[1],
+            )
+
         padded_tokens1, padded_coords1, pad_mask1, mean_groups1 = model.merge1(
-            tokens, coords, group_ids1
+            tokens, coords, group_ids1, token_weights=token_weights1,
         )
 
         # ---- Stage 2 ----
@@ -135,14 +139,22 @@ def _get_intermediate(
             for block in model.encoder2:
                 padded_tokens1 = block(padded_tokens1, padded_coords1, pad_mask1)
 
-        hard2, _, _   = model.router2(
-            padded_tokens1, src2, dst2, valid2, model.target_group_size_2, n_real1
+        hard2, probs2, _ = model.router2(
+            padded_tokens1, src2, dst2, valid2,
+            model.target_group_size_2, n_real1,
         )
-        group_ids2    = gpu_connected_components_dynamic(
+        group_ids2 = gpu_connected_components_dynamic(
             hard2.detach(), valid2, src2, dst2, max_G1
         )
-        padded_tokens2, padded_coords2, _, _ = model.merge2(
-            padded_tokens1, padded_coords1, group_ids2
+
+        token_weights2 = None
+        if getattr(model, "weighted_merge", False):
+            token_weights2 = edge_probs_to_token_weights_dynamic(
+                probs2, hard2, valid2, src2, dst2, max_G1,
+            )
+
+        padded_tokens2, padded_coords2, _, mean_groups2 = model.merge2(
+            padded_tokens1, padded_coords1, group_ids2, token_weights=token_weights2,
         )
 
         # Corrected Stage 2 padding mask — same logic as ASFNet2.forward()
