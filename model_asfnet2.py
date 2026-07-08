@@ -451,6 +451,7 @@ class ASFNet2(nn.Module):
         target_group_size_2:  float = 3.0,  # Stage 2 compression: G1 → G1/target_group_size_2
         router_proj_dim:      int   = 64,
         knn_k:                int   = 6,
+        weighted_merge: bool = False,
         local_encoder1: bool = False,
         local_radius: int = 1,
         local_encoder2: bool = False,
@@ -505,7 +506,10 @@ class ASFNet2(nn.Module):
         self.norm       = nn.LayerNorm(d_model)
         self.classifier = nn.Linear(d_model, num_classes)
 
-    def forward(
+        self.knn_k = knn_k
+        self.weighted_merge = weighted_merge
+
+def forward(
         self,
         x: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, float, float]:
