@@ -48,24 +48,29 @@ def _load_model(path: str, device: torch.device) -> tuple[ASFNet2, dict]:
         patch_size          = a["patch_size"],
         in_channels         = 3,
         d_model             = a["d_model"],
-        num_heads           = a["num_heads"],
-        encoder1_blocks     = a["encoder1_blocks"],
-        encoder2_blocks     = a["encoder2_blocks"],
-        main_blocks         = a["main_blocks"],
-        mlp_ratio           = a["mlp_ratio"],
-        num_classes         = a["num_classes"],
-        target_group_size_1 = a["target_group_size_1"],
-        target_group_size_2 = a["target_group_size_2"],
-        router_proj_dim     = a["router_proj_dim"],
-        knn_k               = a["knn_k"],
-        local_encoder1      = a.get("local_encoder1", False),
-        local_radius        = a.get("local_radius", 1),
-        local_encoder2      = a.get("local_encoder2", False),
-        local_encoder2_safe = a.get("local_encoder2_safe", False),
-        weighted_merge=a.get("weighted_merge", False),
-        # ... plus the local_* flags already there, unchanged
+        num_heads            = a["num_heads"],
+        encoder1_blocks      = a["encoder1_blocks"],
+        encoder2_blocks      = a["encoder2_blocks"],
+        main_blocks          = a["main_blocks"],
+        mlp_ratio            = a["mlp_ratio"],
+        num_classes          = a["num_classes"],
+        target_group_size_1  = a["target_group_size_1"],
+        target_group_size_2  = a["target_group_size_2"],
+        router_proj_dim      = a["router_proj_dim"],
+        knn_k                = a["knn_k"],
+        local_encoder1       = a.get("local_encoder1", False),
+        local_radius         = a.get("local_radius", 1),
+        local_encoder2       = a.get("local_encoder2", False),
+        local_encoder2_safe  = a.get("local_encoder2_safe", False),
+        weighted_merge       = a.get("weighted_merge", False),
     )
-    model.load_state_dict(ckpt["model"])
+
+    state_dict = ckpt["model"]
+    # torch.compile wraps the model in OptimizedModule, which prefixes every
+    # saved key with "_orig_mod." — strip it so it matches the plain model.
+    state_dict = { k.removeprefix("_orig_mod."): v for k, v in state_dict.items() }
+
+    model.load_state_dict(state_dict)
     model.to(device).eval()
 
     print(f"Loaded  epoch {ckpt['epoch'] + 1}  "
