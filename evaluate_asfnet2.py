@@ -65,7 +65,9 @@ def _load_model(path: str, device: torch.device) -> tuple[ASFNet2, dict]:
         weighted_merge=a.get("weighted_merge", False),
         # ... plus the local_* flags already there, unchanged
     )
-    model.load_state_dict(ckpt["model"])
+    state_dict = ckpt["model"]
+    state_dict = {k.replace("_orig_mod.", "", 1): v for k, v in state_dict.items()}
+    model.load_state_dict(state_dict)
     model.to(device).eval()
 
     print(f"Loaded  epoch {ckpt['epoch'] + 1}  "
