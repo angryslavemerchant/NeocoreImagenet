@@ -114,6 +114,52 @@ def build_knn_edges(
 
     return src, dst, valid
 
+def edge_probs_to_token_weights_dynamic(
+    probs:    torch.Tensor,   # (B, E) soft boundary probs on k-NN edges
+    hard:     torch.Tensor,   # (B, E) hard decisions
+    valid:    torch.Tensor,   # (B, E) real-edge mask from build_knn_edges
+    src:      torch.Tensor,   # (B, E) source token idx
+    dst:      torch.Tensor,   # (B, E) destination token idx
+    n_tokens: int,            # max_G1 — tokens per image (incl. padding)
+) -> torch.Tensor:
+    """
+    Stage 2 border-only linear merge weights — the per-image k-NN analogue of
+    edge_probs_to_token_weights (model_asfnet.py).
+
+    A token is 'border' if any of its VALID incident k-NN edges is a cut.
+    Interior tokens get weight 0 → dropped. Padding tokens have no valid edges,
+    so they also get 0 (which is what we want — they were masked anyway). Border
+    tokens get w = s = sum of their valid incident edge probs, so higher boundary
+    prob → higher weight. Gradient to `probs` flows through border tokens only.
+
+    Uses per-image scatter_add (indices are (B, E), not a shared buffer), and
+    multiplies by `valid` so invalid/padding edges contribute nothing regardless
+    of the arbitrary indices they carry. Returns (B, n_tokens).
+    """
+    B       = probs.shape[0]
+    device  = probs.device
+    valid_f = valid.to(probs.dtype)                      # (B, E)
+
+    # Padding-source rows carry arbitrary dst indices; clamp to stay in-bounds.
+    # Their contribution is zeroed by valid_f, so the clamp target is irrelevant.
+    src_c = src.clamp(0, n_tokens - 1)
+    dst_c = dst.clamp(0, n_tokens - 1)
+
+    # s_m: soft boundary evidence per token over valid incident edges (grad→probs)
+    pw = probs * valid_f                                 # (B, E)
+    s  = torch.zeros(B, n_tokens, device=device, dtype=probs.dtype)
+    s  = s.scatter_add(1, src_c, pw)
+    s  = s.scatter_add(1, dst_c, pw)
+
+    # border indicator from hard (detached — routing fact, not a gradient path)
+    hb     = hard.detach() * valid_f                     # (B, E)
+    border = torch.zeros(B, n_tokens, device=device, dtype=probs.dtype)
+    border = border.scatter_add(1, src_c, hb)
+    border = border.scatter_add(1, dst_c, hb)
+    is_border = (border > 0.5).to(probs.dtype)           # (B, n_tokens)
+
+    return s * is_border                                 # (B, n_tokens)
+
 
 # ---------------------------------------------------------------------------
 # Stage 2 local-attention mask — dense adjacency from the k-NN edge lists
@@ -463,49 +509,36 @@ class ASFNet2(nn.Module):
         self,
         x: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, float, float]:
-        """
-        Args:
-            x: (B, C, H, W)
-
-        Returns:
-            logits:       (B, num_classes)
-            l_ratio1:     scalar — Stage 1 ratio loss
-            l_ratio2:     scalar — Stage 2 ratio loss
-            mean_groups1: float  — avg Stage 1 group count (diagnostic)
-            mean_groups2: float  — avg Stage 2 group count (diagnostic)
-        """
         # ---- Stage 1 ----
         tokens, coords = self.patch_embed(x)   # (B, N1, D)
 
         for block in self.encoder1:
             tokens = block(tokens, coords)
 
-        hard1, _, l_ratio1 = self.router1(tokens, self.target_group_size_1)
+        hard1, probs1, l_ratio1 = self.router1(tokens, self.target_group_size_1)
 
         group_ids1 = gpu_connected_components(
             hard1.detach(), self.router1.edge_indices, tokens.shape[1]
         )
 
-        # padded_tokens1: (B, max_G1, D) — real slots followed by padding
-        # pad_mask1:      (B, max_G1)    — True = padding slot
+        token_weights1 = None
+        if self.weighted_merge:
+            token_weights1 = edge_probs_to_token_weights(
+                probs1, hard1, self.router1.edge_indices, tokens.shape[1],
+            )
+
         padded_tokens1, padded_coords1, pad_mask1, mean_groups1 = self.merge1(
-            tokens, coords, group_ids1
+            tokens, coords, group_ids1, token_weights=token_weights1,
         )
 
         # ---- Stage 2 adjacency ----
-        # k-NN depends only on Stage 1 centroids + padding, NOT on encoder2
-        # output, so build it once up front and reuse it for both the encoder2
-        # local-attention mask and the router. (Reordering vs. the original is
-        # behaviour-identical in the global-encoder2 case.)
         n_real1 = (~pad_mask1).sum(dim=1)   # (B,) real token count per image
         src2, dst2, valid2 = build_knn_edges(padded_coords1, pad_mask1, self.knn_k)
         max_G1 = padded_tokens1.shape[1]
 
         # ---- Stage 2 encoder ----
         if self.local_encoder2:
-            # Attention restricted to the k-NN neighbourhood (self-loops added).
-            # This mask already excludes padding keys, so no separate pad mask.
-            adj2 = knn_edges_to_mask(src2, dst2, valid2, max_G1)   # (B, G1, G1) bool
+            adj2 = knn_edges_to_mask(src2, dst2, valid2, max_G1)
             for block in self.encoder2:
                 padded_tokens1 = block(padded_tokens1, padded_coords1, adj2)
         else:
@@ -513,7 +546,7 @@ class ASFNet2(nn.Module):
                 padded_tokens1 = block(padded_tokens1, padded_coords1, pad_mask1)
 
         # ---- Stage 2 routing ----
-        hard2, _, l_ratio2 = self.router2(
+        hard2, probs2, l_ratio2 = self.router2(
             padded_tokens1, src2, dst2, valid2,
             self.target_group_size_2, n_real1,
         )
@@ -522,37 +555,26 @@ class ASFNet2(nn.Module):
             hard2.detach(), valid2, src2, dst2, max_G1
         )
 
-        # padded_tokens2: (B, max_G2, D)
-        # GroupMerge's own pad_mask (based on group count) doesn't account for
-        # Stage 1 padding propagating through — we recompute it below.
+        token_weights2 = None
+        if self.weighted_merge:
+            token_weights2 = edge_probs_to_token_weights_dynamic(
+                probs2, hard2, valid2, src2, dst2, max_G1,
+            )
+
         padded_tokens2, padded_coords2, _, mean_groups2 = self.merge2(
-            padded_tokens1, padded_coords1, group_ids2
+            padded_tokens1, padded_coords1, group_ids2, token_weights=token_weights2,
         )
 
-        # ---- Stage 2 padding mask ----
-        #
-        # GroupMerge2's built-in pad_mask just marks slots beyond the per-image
-        # group count. That's not sufficient here: some of those groups were
-        # formed by merging Stage 1 PADDING tokens (isolated because they had no
-        # valid edges). Those Stage 2 groups are also padding, even if they sit
-        # within the max-group count for the batch.
-        #
-        # Fix: scatter the real/fake indicator from Stage 1 into Stage 2 group
-        # slots. A Stage 2 group is real iff at least one of its contributing
-        # Stage 1 tokens was real.
-        #
-        # real1[b, i] = 1.0  iff Stage 1 slot i is a real group for image b
-        # real2_sum[b, g2] = sum of real1[b, i] for all i mapping to g2
-        # → pad_mask2[b, g2] = True iff real2_sum == 0 (all-padding group)
-        max_G2          = padded_tokens2.shape[1]
-        real1           = (~pad_mask1).float()             # (B, max_G1)
-        real2_sum       = torch.zeros(x.shape[0], max_G2, device=x.device)
-        ids2_clamped    = group_ids2.clamp(0, max_G2 - 1)
+        # ---- Stage 2 padding mask (unchanged) ----
+        max_G2       = padded_tokens2.shape[1]
+        real1        = (~pad_mask1).float()
+        real2_sum    = torch.zeros(x.shape[0], max_G2, device=x.device)
+        ids2_clamped = group_ids2.clamp(0, max_G2 - 1)
         real2_sum.scatter_add_(1, ids2_clamped, real1)
-        pad_mask2 = real2_sum < 0.5                        # (B, max_G2)
+        pad_mask2    = real2_sum < 0.5
         mean_groups2 = float((~pad_mask2).sum(dim=1).float().mean().item())
 
-        # ---- Main network + classifier ----
+        # ---- Main network + classifier (unchanged) ----
         for block in self.main_net:
             padded_tokens2 = block(padded_tokens2, padded_coords2, pad_mask2)
 

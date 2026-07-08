@@ -240,6 +240,12 @@ def main():
                              "an additive mask + math backend, to rule out low-precision "
                              "/ fused-kernel instability. Slower; disable torch.compile.")
 
+    parser.add_argument("--weighted_merge", action="store_true",
+                        help="Confidence-weighted GroupMerge: puts router probs on the "
+                             "gradient path to the loss. Default off = original mean pool.")
+
+
+
     # --- Training ---
     parser.add_argument("--batch_size",          type=int,   default=1024)
     parser.add_argument("--num_epochs",          type=int,   default=90)
