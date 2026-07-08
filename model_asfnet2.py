@@ -509,12 +509,13 @@ class ASFNet2(nn.Module):
         self.knn_k = knn_k
         self.weighted_merge = weighted_merge
 
-def forward(
-        self,
-        x: torch.Tensor,
+
+    def forward(
+            self,
+            x: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, float, float]:
         # ---- Stage 1 ----
-        tokens, coords = self.patch_embed(x)   # (B, N1, D)
+        tokens, coords = self.patch_embed(x)  # (B, N1, D)
 
         for block in self.encoder1:
             tokens = block(tokens, coords)
@@ -536,7 +537,7 @@ def forward(
         )
 
         # ---- Stage 2 adjacency ----
-        n_real1 = (~pad_mask1).sum(dim=1)   # (B,) real token count per image
+        n_real1 = (~pad_mask1).sum(dim=1)  # (B,) real token count per image
         src2, dst2, valid2 = build_knn_edges(padded_coords1, pad_mask1, self.knn_k)
         max_G1 = padded_tokens1.shape[1]
 
@@ -570,12 +571,12 @@ def forward(
         )
 
         # ---- Stage 2 padding mask (unchanged) ----
-        max_G2       = padded_tokens2.shape[1]
-        real1        = (~pad_mask1).float()
-        real2_sum    = torch.zeros(x.shape[0], max_G2, device=x.device)
+        max_G2 = padded_tokens2.shape[1]
+        real1 = (~pad_mask1).float()
+        real2_sum = torch.zeros(x.shape[0], max_G2, device=x.device)
         ids2_clamped = group_ids2.clamp(0, max_G2 - 1)
         real2_sum.scatter_add_(1, ids2_clamped, real1)
-        pad_mask2    = real2_sum < 0.5
+        pad_mask2 = real2_sum < 0.5
         mean_groups2 = float((~pad_mask2).sum(dim=1).float().mean().item())
 
         # ---- Main network + classifier (unchanged) ----
@@ -584,10 +585,10 @@ def forward(
 
         padded_tokens2 = self.norm(padded_tokens2)
 
-        real_mask   = (~pad_mask2).float()
-        token_sum   = (padded_tokens2 * real_mask.unsqueeze(-1)).sum(dim=1)
+        real_mask = (~pad_mask2).float()
+        token_sum = (padded_tokens2 * real_mask.unsqueeze(-1)).sum(dim=1)
         token_count = real_mask.sum(dim=1, keepdim=True).clamp(min=1)
-        pooled      = token_sum / token_count
+        pooled = token_sum / token_count
 
         logits = self.classifier(pooled)
         return logits, l_ratio1, l_ratio2, mean_groups1, mean_groups2
