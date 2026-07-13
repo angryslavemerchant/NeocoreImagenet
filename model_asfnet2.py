@@ -607,3 +607,13 @@ class ASFNet2(nn.Module):
             "norm+head":    n(self.norm) + n(self.classifier),
             "total":        n(self),
         }
+
+#ughhhh.
+#new strat. instead of meanpooling border tokens, we keep all of them.
+# with all kept border tokens, we can compare borders against borders on the grid still.
+# that way, we maintain all spatial congruity.
+# islands are basically always kept, and maybe should always be kept down the line.
+# inspiration is because currently stage 2 basically destabilizes stage 1 chunking.
+# stage 1 chunking is beautiful, but add on stage 2, and its not even stage 2 that grouping too hard,
+# but the influence of having that second stage is degenerating stage 1.
+# might be related to graph noding, maybe mean pooling. anyhoo, we're moving forward with this.
