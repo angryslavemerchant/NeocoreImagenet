@@ -2,6 +2,6 @@
   "download_mbps": 300,
   "disk_write_mbps": 500,
   "cpu_jpeg_per_sec": 3000,
-  "pcie_h2d_gbps": 8.0,
+  "pcie_h2d_gbps": 5.0,
   "gpu_bf16_tflops": 90
 }
