@@ -60,6 +60,10 @@ below, then `launch.py launch --offer <ID>`.
 
 ## Known-bad machines (add as found; also `.vast/blacklist.json`)
 
+- machine 12092 — Core Ultra 9 285K, Nevada. Instance never booted (no
+  ONSTART after ~7 min, no logs) and vanished from the API; user confirmed
+  it never loaded, 2026-07-15.
+
 - machine 14825 — docker daemon broken (OCI runtime create failed), 2026-07-14
 - machine 9020  — instances wedge in created/stopped, never boot; ignores
   explicit start, 2026-07-14
