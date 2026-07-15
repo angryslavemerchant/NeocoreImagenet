@@ -64,6 +64,9 @@ below, then `launch.py launch --offer <ID>`.
   ONSTART after ~7 min, no logs) and vanished from the API; user confirmed
   it never loaded, 2026-07-15.
 
+- machine 48680 — i7-12700KF, Washington. Boots and trains fine, then GPU
+  hangs mid-run: DALI decode hit CUDA_ERROR_LAUNCH_TIMEOUT (702) in epoch 4
+  of a probe run, process aborted, 2026-07-15
 - machine 14825 — docker daemon broken (OCI runtime create failed), 2026-07-14
 - machine 9020  — instances wedge in created/stopped, never boot; ignores
   explicit start, 2026-07-14
