@@ -385,8 +385,11 @@ class ASFNetBR(nn.Module):
             sel:         (B, max_K) original grid index per slot
             keep:        (B, N) bool retention mask (True = kept)
             l_ratio:     scalar ratio loss
-            mean_kept:   float — avg retained tokens per image
-            mean_groups: float — avg stage-1 group count (diagnostic)
+            mean_kept:   0-dim GPU tensor — avg retained tokens per image
+            mean_groups: 0-dim GPU tensor — avg stage-1 group count
+                         (both lazy: call .item() only at logging time —
+                         an .item() here would force a CPU/GPU sync every
+                         training step)
         """
         tokens, coords = self.patch_embed(x)
         N = tokens.shape[1]
@@ -419,8 +422,8 @@ class ASFNetBR(nn.Module):
 
         tok_c = self.norm(tok_c)
 
-        mean_kept   = float(n_keep.float().mean().item())
-        mean_groups = float((group_ids.max(dim=1).values + 1).float().mean().item())
+        mean_kept   = n_keep.float().mean().detach()
+        mean_groups = (group_ids.max(dim=1).values + 1).float().mean().detach()
 
         return tok_c, coord_c, pad_mask, sel, keep, l_ratio, mean_kept, mean_groups
 
@@ -436,7 +439,8 @@ class ASFNetBR(nn.Module):
         pooled      = token_sum / token_count
 
         logits = self.classifier(pooled)
-        return logits, l_ratio, mean_kept, mean_groups
+        # Classifier callers (train_asfnet_br.py) expect plain floats.
+        return logits, l_ratio, float(mean_kept.item()), float(mean_groups.item())
 
     def count_parameters(self) -> dict:
         def n(m): return sum(p.numel() for p in m.parameters()) if m is not None else 0

@@ -25,7 +25,7 @@ def main():
     args = parser.parse_args()
 
     run = wandb.init(
-        project=os.environ.get("WANDB_PROJECT", "asfnet"),
+        project=os.environ.get("WANDB_PROJECT", "asfnetAE"),
         id=os.environ.get("WANDB_RUN_ID"),
         resume="allow",
     )

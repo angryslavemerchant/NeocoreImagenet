@@ -1,5 +1,5 @@
-"""
-vast/launch.py — local orchestrator for Vast.ai training runs.
+﻿"""
+vast/launch.py â€” local orchestrator for Vast.ai training runs.
 
 Runs on the local machine (Windows: use the Anaconda python). Wraps the
 `vastai` CLI; reads secrets from vast/secrets.env (gitignored). State about
@@ -67,7 +67,7 @@ VASTAI = (shutil.which("vastai")
 
 def load_secrets() -> dict:
     if not SECRETS.exists():
-        sys.exit(f"Missing {SECRETS} — create it with VAST_API_KEY, "
+        sys.exit(f"Missing {SECRETS} â€” create it with VAST_API_KEY, "
                  "WANDB_API_KEY, HF_TOKEN lines.")
     out = {}
     for line in SECRETS.read_text().splitlines():
@@ -115,9 +115,9 @@ def resolve_id(args) -> int:
     if len(live) == 1:
         return live[0]["id"]
     if not live:
-        sys.exit("No tracked instances — pass --id (see `status`).")
+        sys.exit("No tracked instances â€” pass --id (see `status`).")
     ids = ", ".join(str(r["id"]) for r in live)
-    sys.exit(f"Multiple tracked instances ({ids}) — pass --id.")
+    sys.exit(f"Multiple tracked instances ({ids}) â€” pass --id.")
 
 
 # ---------------------------------------------------------------------------
@@ -157,7 +157,7 @@ def _is_server_cpu(o: dict) -> bool:
 
 def pick_offer(offers: list):
     """
-    Not the cheapest — the bottom of the price range is where the lemons
+    Not the cheapest â€” the bottom of the price range is where the lemons
     live (learned the hard way: 3 of the 4 cheapest hosts in a row failed
     to boot or run CUDA). Pick near the middle of the price distribution,
     preferring consumer CPUs (Ryzen/Core), which are generally faster per
@@ -186,7 +186,7 @@ def fmt_offer(o: dict) -> str:
 def cmd_search(args):
     offers = search_offers(args.gpu, args.max_dph, args.inet)
     if not offers:
-        print("No offers matched — relax --max-dph or --inet.")
+        print("No offers matched â€” relax --max-dph or --inet.")
         return
     print(f"Top {len(offers)} offers for {args.gpu}:")
     for o in offers:
@@ -205,7 +205,7 @@ def build_onstart(branch: str, train_args: str, bench_only: bool,
     if keep_alive:
         exports.append("export KEEP_ALIVE=1")
     # Run our provisioning in the background and hand the foreground to the
-    # template's own entrypoint.sh (portal/jupyter/workspace setup) — do NOT
+    # template's own entrypoint.sh (portal/jupyter/workspace setup) â€” do NOT
     # replace it. Our output still reaches `vastai logs` via /proc/1/fd/1.
     provision = (
         "cd /workspace && rm -rf NeocoreImagenet && "
@@ -228,7 +228,7 @@ def create_instance(offer_id: int, secrets: dict, branch: str,
            f"-e WANDB_API_KEY={secrets['WANDB_API_KEY']} "
            f"-e HF_TOKEN={secrets['HF_TOKEN']} "
            f"-e VAST_API_KEY={secrets['VAST_API_KEY']} "
-           f"-e WANDB_PROJECT=asfnet")
+           f"-e WANDB_PROJECT=asfnetAE")
     onstart = build_onstart(branch, train_args, bench_only, keep_alive)
     result = vast("create", "instance", offer_id,
                   "--image", IMAGE,
@@ -276,7 +276,7 @@ def cmd_launch(args):
     print(f"\nInstance {iid} created.")
     print(f"  watch:   python vast/launch.py logs --id {iid}")
     print(f"  destroy: python vast/launch.py destroy --id {iid}")
-    print("  wandb:   project 'asfnet' — run appears once training starts")
+    print("  wandb:   project 'asfnetAE' â€” run appears once training starts")
 
 
 # ---------------------------------------------------------------------------
@@ -375,7 +375,7 @@ def cmd_scan(args):
         if slot["result"]:
             entry.update(slot["result"])
         else:
-            entry["error"] = "timeout — no benchmark received"
+            entry["error"] = "timeout â€” no benchmark received"
         results.append(entry)
     SCAN_OUT.write_text(json.dumps(results, indent=2))
     print(f"\nWrote {SCAN_OUT}")
@@ -387,14 +387,14 @@ def cmd_scan(args):
         print("\nResults:")
         for r in ok:
             print("  " + json.dumps(r))
-        print("\nSuggested gate thresholds (70% of median — update "
+        print("\nSuggested gate thresholds (70% of median â€” update "
               "vast/thresholds.json and push):")
         for m in metrics:
             vals = [r[m] for r in ok if m in r]
             if vals:
                 print(f'  "{m}": {round(0.7 * statistics.median(vals), 1)},')
     else:
-        print("No successful benchmarks — inspect logs / retry.")
+        print("No successful benchmarks â€” inspect logs / retry.")
 
 
 # ---------------------------------------------------------------------------

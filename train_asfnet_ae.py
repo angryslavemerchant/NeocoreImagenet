@@ -23,6 +23,7 @@ classifier head. (The keys line up by construction.)
 """
 
 import os
+import time
 import random
 import argparse
 
@@ -30,10 +31,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 import wandb
-try:  # torch >= 2.4 moved GradScaler; torch.cuda.amp variant may be removed
-    from torch.amp import GradScaler
-except ImportError:
-    from torch.cuda.amp import GradScaler
 from tqdm import tqdm
 
 from dataset import get_dataloaders
@@ -72,12 +69,12 @@ def save_checkpoint(state: dict, path: str):
     torch.save(state, path)
 
 
-def load_checkpoint(path, model, optimizer, scaler, device):
+def load_checkpoint(path, model, optimizer, device):
     ckpt = torch.load(path, map_location=device, weights_only=True)
     model.load_state_dict(ckpt["model"])
     optimizer.load_state_dict(ckpt["optimizer"])
-    if "scaler" in ckpt:
-        scaler.load_state_dict(ckpt["scaler"])
+    # older checkpoints carry a GradScaler state — obsolete (bf16 needs no
+    # scaler), ignored on load
     start_epoch = ckpt["epoch"] + 1
     best_val    = ckpt.get("best_val_rec", float("inf"))
     images_seen = ckpt.get("images_seen", 0)
@@ -85,10 +82,14 @@ def load_checkpoint(path, model, optimizer, scaler, device):
     return start_epoch, best_val, images_seen
 
 
-def run_epoch(model, loader, optimizer, scaler, args, epoch, device,
+def run_epoch(model, loader, optimizer, args, epoch, device,
               global_step, images_seen, train: bool):
     model.train() if train else model.eval()
 
+    # Meters are fed 0-dim GPU tensors — averages stay on-device and are
+    # only .item()'d at logging points. Anything per-step that touches the
+    # value (f-strings included) forces a CPU/GPU sync and serialises the
+    # pipeline, which dominates step time for a model this small.
     rec_losses   = AverageMeter()
     ratio_losses = AverageMeter()
     kept         = AverageMeter()
@@ -97,9 +98,16 @@ def run_epoch(model, loader, optimizer, scaler, args, epoch, device,
     tag  = "train" if train else "val"
     pbar = tqdm(loader, desc=f"Epoch {epoch+1}/{args.num_epochs} [{tag}]", leave=False)
 
+    t_epoch   = time.perf_counter()
+    data_wait = 0.0
+    n_images  = 0
+    step_in_epoch = 0
+
     ctx = torch.enable_grad() if train else torch.no_grad()
     with ctx:
+        t_iter = time.perf_counter()
         for images, _labels in pbar:   # labels ignored — self-supervised
+            data_wait += time.perf_counter() - t_iter
             images = images.to(device, non_blocking=True)
             B = images.size(0)
 
@@ -109,43 +117,52 @@ def run_epoch(model, loader, optimizer, scaler, args, epoch, device,
 
             if train:
                 optimizer.zero_grad()
-                scaler.scale(loss).backward()
-                scaler.unscale_(optimizer)
+                loss.backward()   # bf16 autocast — no GradScaler needed
                 nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-                scaler.step(optimizer)
-                scaler.update()
+                optimizer.step()
 
-            rec_losses.update(loss_rec.item(), B)
-            ratio_losses.update(l_ratio.item(), B)
+            rec_losses.update(loss_rec.detach(), B)
+            ratio_losses.update(l_ratio.detach(), B)
             kept.update(mean_kept, B)
             dropf.update(drop_frac, B)
+            n_images      += B
+            step_in_epoch += 1
 
-            pbar.set_postfix(rec=f"{rec_losses.avg:.4f}",
-                             kept=f"{kept.avg:.1f}",
-                             drop=f"{dropf.avg:.2f}")
+            if step_in_epoch % 25 == 0:   # sparse: each refresh syncs
+                pbar.set_postfix(rec=f"{float(rec_losses.avg):.4f}",
+                                 kept=f"{float(kept.avg):.1f}",
+                                 drop=f"{float(dropf.avg):.2f}")
 
             if train:
                 prev_images  = images_seen
                 images_seen += B
                 if images_seen // args.log_interval != prev_images // args.log_interval:
                     wandb.log({
-                        "train/rec_loss":    rec_losses.avg,
-                        "train/ratio_loss":  ratio_losses.avg,
-                        "train/mean_kept":   kept.avg,
-                        "train/drop_frac":   dropf.avg,
+                        "train/rec_loss":    float(rec_losses.avg),
+                        "train/ratio_loss":  float(ratio_losses.avg),
+                        "train/mean_kept":   float(kept.avg),
+                        "train/drop_frac":   float(dropf.avg),
                         "train/images_seen": images_seen,
                     }, step=global_step)
                 global_step += 1
+            t_iter = time.perf_counter()
+
+    epoch_sec = time.perf_counter() - t_epoch
+    sys_stats = {
+        f"sys/{tag}_epoch_sec":      round(epoch_sec, 1),
+        f"sys/{tag}_imgs_per_sec":   round(n_images / max(epoch_sec, 1e-9), 1),
+        f"sys/{tag}_data_wait_frac": round(data_wait / max(epoch_sec, 1e-9), 3),
+    }
 
     if not train:
         wandb.log({
-            "val/rec_loss":   rec_losses.avg,
-            "val/ratio_loss": ratio_losses.avg,
-            "val/mean_kept":  kept.avg,
-            "val/drop_frac":  dropf.avg,
+            "val/rec_loss":   float(rec_losses.avg),
+            "val/ratio_loss": float(ratio_losses.avg),
+            "val/mean_kept":  float(kept.avg),
+            "val/drop_frac":  float(dropf.avg),
         }, step=global_step)
 
-    return rec_losses.avg, global_step, images_seen
+    return float(rec_losses.avg), global_step, images_seen, sys_stats
 
 
 def main():
@@ -188,7 +205,8 @@ def main():
     # --- Infrastructure ---
     parser.add_argument("--checkpoint_dir", type=str, default="./checkpoints_asfnet_ae")
     parser.add_argument("--resume",         type=str, default=None)
-    parser.add_argument("--wandb_project",  type=str, default="asfnet")
+    parser.add_argument("--wandb_project",  type=str,
+                        default=os.environ.get("WANDB_PROJECT", "asfnetAE"))
     parser.add_argument("--wandb_entity",   type=str, default=None)
     parser.add_argument("--run_name",       type=str, default=None)
     parser.add_argument("--log_interval",   type=int, default=10000)
@@ -202,6 +220,7 @@ def main():
     args = parser.parse_args()
 
     set_seed(args.seed)
+    torch.set_float32_matmul_precision("high")   # TF32 for the fp32 paths
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
 
     if args.run_name is None:
@@ -234,7 +253,6 @@ def main():
         optimizer, schedulers=[warmup_sched, cosine_sched],
         milestones=[args.warmup_epochs])
 
-    scaler       = GradScaler()
     start_epoch  = 0
     best_val_rec = float("inf")
     global_step  = 0
@@ -242,7 +260,7 @@ def main():
 
     if args.resume:
         start_epoch, best_val_rec, images_seen = load_checkpoint(
-            args.resume, model, optimizer, scaler, device)
+            args.resume, model, optimizer, device)
 
     print(f"\nTraining '{args.run_name}' on {device}  (self-supervised, labels unused)")
     print(f"Epochs: {args.num_epochs}  |  Batch: {args.batch_size}  |  LR: {args.lr}\n")
@@ -251,22 +269,44 @@ def main():
         current_lr = optimizer.param_groups[0]["lr"]
         wandb.log({"train/lr": current_lr}, step=global_step)
 
-        train_rec, global_step, images_seen = run_epoch(
-            model, train_loader, optimizer, scaler, args, epoch, device,
+        train_rec, global_step, images_seen, train_sys = run_epoch(
+            model, train_loader, optimizer, args, epoch, device,
             global_step, images_seen, train=True)
-        val_rec, global_step, _ = run_epoch(
-            model, val_loader, optimizer, scaler, args, epoch, device,
+        val_rec, global_step, _, val_sys = run_epoch(
+            model, val_loader, optimizer, args, epoch, device,
             global_step, images_seen, train=False)
         scheduler.step()
 
+        peak_vram_gb = round(torch.cuda.max_memory_allocated() / 2**30, 2) \
+            if device.type == "cuda" else 0.0
+        wandb.log({**train_sys, **val_sys, "sys/peak_vram_gb": peak_vram_gb},
+                  step=global_step)
+
         print(f"[{epoch+1:03d}/{args.num_epochs}] lr {current_lr:.2e} | "
-              f"train rec {train_rec:.4f} | val rec {val_rec:.4f}")
+              f"train rec {train_rec:.4f} | val rec {val_rec:.4f} | "
+              f"{train_sys['sys/train_epoch_sec']:.0f}s "
+              f"({train_sys['sys/train_imgs_per_sec']:.0f} img/s, "
+              f"data-wait {train_sys['sys/train_data_wait_frac']:.0%}) | "
+              f"peak VRAM {peak_vram_gb:.1f} GB")
+
+        if epoch == start_epoch:
+            # One-time compile diagnostics: fragmentation here means
+            # torch.compile is falling back to eager between graph breaks.
+            try:
+                from torch._dynamo.utils import counters
+                stats  = dict(counters["stats"])
+                breaks = sum(counters["graph_break"].values())
+                print(f"[compile] stats={stats} graph_break_sites={breaks}")
+                for reason, cnt in sorted(counters["graph_break"].items(),
+                                          key=lambda kv: -kv[1])[:5]:
+                    print(f"[compile]   x{cnt}  {str(reason)[:140]}")
+            except Exception as e:
+                print(f"[compile] diagnostics unavailable: {e}")
 
         ckpt = {
             "epoch":        epoch,
             "model":        model.state_dict(),
             "optimizer":    optimizer.state_dict(),
-            "scaler":       scaler.state_dict(),
             "val_rec":      val_rec,
             "best_val_rec": best_val_rec,
             "images_seen":  images_seen,

@@ -9,7 +9,7 @@ cd "$(dirname "$0")/.."
 export PYTHONUNBUFFERED=1
 
 INSTANCE_ID="${VAST_CONTAINERLABEL#C.}"
-export WANDB_PROJECT="${WANDB_PROJECT:-asfnet}"
+export WANDB_PROJECT="${WANDB_PROJECT:-asfnetAE}"
 
 # PY / VAST_CLI are exported by onstart.sh; resolve again if run standalone.
 PY="${PY:-$( [ -x /venv/main/bin/python ] && echo /venv/main/bin/python || echo python3 )}"

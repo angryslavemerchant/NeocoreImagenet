@@ -8,7 +8,7 @@ from HuggingFace on first run; DALI dataloading via a one-time JPEG cache).
 - `*_ae` — self-supervised MAE-style autoencoder on the ASFNetBR backbone.
   Current research direction. Eval/visualisation: `evaluate_asfnet_br.py --ae`
   (reconstruction + retention panels); non-AE modes produce chunk-map grids.
-- Training logs to wandb (project `asfnet` for AE).
+- Training logs to wandb (project `asfnetAE` for AE runs).
 
 ## Local environment (Windows)
 

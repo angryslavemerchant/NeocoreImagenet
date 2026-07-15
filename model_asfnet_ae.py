@@ -146,16 +146,18 @@ class ASFNetAE(nn.Module):
     def forward(
         self,
         imgs: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, float, float, float]:
+    ) -> tuple[torch.Tensor, ...]:
         """
         Returns:
             loss_rec:    scalar — MSE on DROPPED patches only
                          (per-patch-normalised targets if norm_pix_loss)
             l_ratio:     scalar — the backbone's ratio loss (guard rail;
                          see train script notes on scheduling it down)
-            mean_kept:   float  — avg retained tokens per image
-            mean_groups: float  — avg stage-1 group count
-            drop_frac:   float  — avg fraction of patches reconstructed
+            mean_kept:   0-dim tensor — avg retained tokens per image
+            mean_groups: 0-dim tensor — avg stage-1 group count
+            drop_frac:   0-dim tensor — avg fraction of patches reconstructed
+                         (stats stay on GPU; .item() them only when logging,
+                         otherwise every step pays a CPU/GPU sync)
         """
         feats, _, pad_mask, sel, keep, l_ratio, mean_kept, mean_groups = \
             self.backbone.forward_features(imgs)
@@ -173,7 +175,7 @@ class ASFNetAE(nn.Module):
         m = (~keep).float()                                 # dropped positions only
         loss_rec = (loss_patch * m).sum() / m.sum().clamp(min=1.0)
 
-        drop_frac = float(m.mean().item())
+        drop_frac = m.mean().detach()
         return loss_rec, l_ratio, mean_kept, mean_groups, drop_frac
 
     # ------------------------------------------------------------------
