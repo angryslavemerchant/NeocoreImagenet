@@ -1,15 +1,29 @@
 """
-train_linear_probe.py — linear probe of a pretrained ASFNetAE backbone on
-ImageNet-100 classification.
+train_linear_probe.py — frozen-backbone probe of a pretrained ASFNetAE
+backbone on ImageNet-100 classification.
 
 Loads an AE checkpoint (local path or wandb artifact), copies the
-`backbone.` weights into a classifier ASFNetBR (keys line up by
-construction), FREEZES everything except the linear classifier head, and
-trains that head only.
+`backbone.` weights into an ASFNetBR (keys line up by construction),
+FREEZES the backbone, and trains only a probe head.
+
+Two probe axes, both settable from the CLI:
+
+  --pool attentive|mean   attentive (default) = single learned query
+                          cross-attending over the probed tokens (MAP
+                          head, the standard MAE/I-JEPA eval); mean =
+                          masked GAP + linear (the original cheap probe).
+  --topk N                probe only the top-N survivors ranked by the
+                          router's boundary evidence — the SAME ranking
+                          the AE's keep_budget bottleneck used, so the
+                          probe sees exactly the tokens that received
+                          reconstruction gradient. Default (unset) reads
+                          keep_budget from the checkpoint and matches the
+                          training bottleneck automatically (49 for
+                          budget 0.25); 0 probes all survivors.
 
 This is the cheap comparable metric across AE ablations, not the ceiling —
-MAE-style representations famously score much lower under a linear probe
-than after full fine-tuning. Logging is intentionally minimal: loss and
+MAE-style representations famously score much lower under a probe than
+after full fine-tuning. Logging is intentionally minimal: loss and
 accuracy (project `asfnet` by default, separate from the AE runs).
 
 Usage (cloud):
@@ -42,8 +56,72 @@ def set_seed(seed: int):
     torch.cuda.manual_seed_all(seed)
 
 
+class AttentivePool(nn.Module):
+    """MAP head: one learned query cross-attends over the token set."""
+
+    def __init__(self, d_model: int, num_heads: int):
+        super().__init__()
+        self.query = nn.Parameter(torch.zeros(1, 1, d_model))
+        nn.init.normal_(self.query, std=0.02)
+        self.attn = nn.MultiheadAttention(d_model, num_heads, batch_first=True)
+        self.norm = nn.LayerNorm(d_model)
+
+    def forward(self, feats: torch.Tensor, pad_mask: torch.Tensor) -> torch.Tensor:
+        q = self.query.expand(feats.shape[0], -1, -1)
+        out, _ = self.attn(q, feats, feats,
+                           key_padding_mask=pad_mask, need_weights=False)
+        return self.norm(out[:, 0])
+
+
+class ProbeModel(nn.Module):
+    """Frozen ASFNetBR backbone + trainable probe head.
+
+    topk > 0 reproduces the AE's `_apply_budget` selection: survivors are
+    ranked by detached boundary evidence and only the top-K enter the pool,
+    so the probe grades exactly the tokens the bottleneck trained. topk = 0
+    pools all router-kept survivors (the original probe's behaviour, and a
+    known mismatch when the AE trained with a budget).
+    """
+
+    def __init__(self, backbone: ASFNetBR, d_model: int, num_heads: int,
+                 num_classes: int, pool: str, topk: int):
+        super().__init__()
+        self.backbone = backbone
+        self.pool = pool
+        self.topk = topk
+        self.attn_pool = AttentivePool(d_model, num_heads) if pool == "attentive" else None
+        self.head = nn.Linear(d_model, num_classes)
+
+        for p in self.backbone.parameters():
+            p.requires_grad = False
+
+    def forward(self, images: torch.Tensor) -> torch.Tensor:
+        feats, _, pad_mask, sel, _, _, _, _, s, _ = \
+            self.backbone.forward_features(images)
+
+        if self.topk > 0 and pad_mask.shape[1] > self.topk:
+            # Same ranking key as ASFNetAE._apply_budget. Images with fewer
+            # than topk survivors pull pad slots into the selection; the
+            # gathered pad_mask keeps them out of the pool.
+            s_slot = s.detach().gather(1, sel)
+            s_slot = s_slot.masked_fill(pad_mask, float("-inf"))
+            top = s_slot.topk(self.topk, dim=1).indices          # (B, topk)
+            feats = feats.gather(
+                1, top.unsqueeze(-1).expand(-1, -1, feats.shape[-1]))
+            pad_mask = pad_mask.gather(1, top)
+
+        if self.attn_pool is not None:
+            pooled = self.attn_pool(feats, pad_mask)
+        else:
+            real_mask = (~pad_mask).float()
+            pooled = (feats * real_mask.unsqueeze(-1)).sum(dim=1) \
+                / real_mask.sum(dim=1, keepdim=True).clamp(min=1)
+
+        return self.head(pooled)
+
+
 def load_backbone(args, device) -> tuple[ASFNetBR, dict]:
-    """Resolve the AE checkpoint, build a classifier ASFNetBR with matching
+    """Resolve the AE checkpoint, build a headless ASFNetBR with matching
     architecture, and load the pretrained backbone weights into it."""
     if args.ae_artifact:
         art = wandb.use_artifact(args.ae_artifact)
@@ -64,7 +142,7 @@ def load_backbone(args, device) -> tuple[ASFNetBR, dict]:
         encoder_blocks    = a["encoder_blocks"],
         main_blocks       = a["main_blocks"],
         mlp_ratio         = a["mlp_ratio"],
-        num_classes       = args.num_classes,
+        num_classes       = 0,
         target_group_size = a["target_group_size"],
         router_proj_dim   = a["router_proj_dim"],
     )
@@ -73,24 +151,24 @@ def load_backbone(args, device) -> tuple[ASFNetBR, dict]:
     sd = {k.replace("_orig_mod.", "", 1): v for k, v in ckpt["model"].items()}
     backbone_sd = {k[len("backbone."):]: v for k, v in sd.items()
                    if k.startswith("backbone.")}
-    missing, unexpected = model.load_state_dict(backbone_sd, strict=False)
-    # Only the fresh classifier head may be missing; nothing may be unexpected.
-    non_head_missing = [k for k in missing if not k.startswith("classifier")]
-    assert not non_head_missing, f"backbone keys missing: {non_head_missing}"
-    assert not unexpected, f"unexpected keys: {unexpected}"
+    missing, unexpected = model.load_state_dict(backbone_sd, strict=True)
+    assert not missing and not unexpected
     print(f"Loaded backbone from {ckpt_path} "
-          f"(AE epoch {ckpt['epoch'] + 1}, {len(backbone_sd)} tensors); "
-          f"fresh head: {missing}")
+          f"(AE epoch {ckpt['epoch'] + 1}, {len(backbone_sd)} tensors)")
 
     model.to(device)
-
-    # Freeze everything except the classifier head.
-    for p in model.parameters():
-        p.requires_grad = False
-    for p in model.classifier.parameters():
-        p.requires_grad = True
-
     return model, a
+
+
+def resolve_topk(args, ae_args: dict) -> int:
+    """--topk unset → match the AE's keep_budget bottleneck; 0 → all."""
+    if args.topk is not None:
+        return args.topk
+    keep_budget = ae_args.get("keep_budget", 0.0)
+    if keep_budget <= 0:
+        return 0
+    n_patches = (ae_args["image_size"] // ae_args["patch_size"]) ** 2
+    return max(1, round(n_patches * keep_budget))
 
 
 def evaluate(model, loader, device):
@@ -101,7 +179,7 @@ def evaluate(model, loader, device):
             images = images.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                logits, _, _, _ = model(images)
+                logits = model(images)
                 loss = F.cross_entropy(logits, labels)
             losses.update(loss.detach(), images.size(0))
             top5 = logits.topk(5, dim=1).indices
@@ -112,11 +190,18 @@ def evaluate(model, loader, device):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Linear probe for ASFNetAE")
+    parser = argparse.ArgumentParser(description="Frozen-backbone probe for ASFNetAE")
     parser.add_argument("--ae_artifact",   type=str, default=None,
                         help="wandb artifact ref, e.g. asfnetAE/asfnet-ae-<id>:final")
     parser.add_argument("--ae_checkpoint", type=str, default=None)
     parser.add_argument("--num_classes",   type=int, default=100)
+
+    parser.add_argument("--pool", type=str, default="attentive",
+                        choices=["attentive", "mean"])
+    parser.add_argument("--topk", type=int, default=None,
+                        help="probe only the top-K survivors by boundary "
+                             "evidence; default matches the AE's keep_budget "
+                             "bottleneck, 0 = all survivors")
 
     parser.add_argument("--batch_size",   type=int,   default=1024)
     parser.add_argument("--num_epochs",   type=int,   default=50)
@@ -139,21 +224,29 @@ def main():
     torch.set_float32_matmul_precision("high")
     device = torch.device("cuda")
 
-    if args.run_name is None:
+    auto_name = args.run_name is None
+    if auto_name:
         src = args.ae_artifact or os.path.basename(args.ae_checkpoint or "")
         args.run_name = f"probe_{src.split('/')[-1].replace(':', '_')}"
 
     wandb.init(project=args.wandb_project, name=args.run_name,
                config=vars(args))
 
-    model, ae_args = load_backbone(args, device)
-    wandb.config.update({"ae_args": ae_args})
+    backbone, ae_args = load_backbone(args, device)
+    topk = resolve_topk(args, ae_args)
+    if auto_name:
+        wandb.run.name += f"_{args.pool}" + (f"_top{topk}" if topk else "_all")
+    wandb.config.update({"ae_args": ae_args, "resolved_topk": topk})
+    print(f"Probe: pool={args.pool}, topk={topk or 'all survivors'}")
+
+    model = ProbeModel(backbone, ae_args["d_model"], ae_args["num_heads"],
+                       args.num_classes, args.pool, topk).to(device)
     model = torch.compile(model)
 
     train_loader, val_loader = get_dataloaders(args)
 
     head_params = [p for p in model.parameters() if p.requires_grad]
-    print(f"Trainable params: {sum(p.numel() for p in head_params):,} (head only)")
+    print(f"Trainable params: {sum(p.numel() for p in head_params):,} (probe head only)")
     optimizer = torch.optim.AdamW(head_params, lr=args.lr,
                                   weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -171,7 +264,7 @@ def main():
             images = images.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                logits, _, _, _ = model(images)
+                logits = model(images)
                 loss = F.cross_entropy(logits, labels)
             optimizer.zero_grad()
             loss.backward()

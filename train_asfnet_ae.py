@@ -63,6 +63,7 @@ def build_model(args) -> ASFNetAE:
         norm_pix_loss     = not args.no_norm_pix,
         keep_budget       = args.keep_budget,
         keep_ratio_target = args.keep_ratio_target,
+        xattn_slots       = args.xattn_slots,
     )
 
 
@@ -217,6 +218,12 @@ def main():
     parser.add_argument("--keep_loss_weight", type=float, default=0.03,
                         help="Weight on the token-level keep-rate loss "
                              "(only active with --keep_ratio_target > 0).")
+    parser.add_argument("--xattn_slots", type=int, default=0,
+                        help="Slot bottleneck: S learned queries cross-attend "
+                             "over the survivors and only the S x D code "
+                             "reaches the decoder (loss on ALL patches). "
+                             "e.g. 49 to rate-match --keep_budget 0.25. "
+                             "0 = off; mutually exclusive with keep_budget.")
 
     # --- Data ---
     parser.add_argument("--dataset_name",      type=str, default="clane9/imagenet-100")

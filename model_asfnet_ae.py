@@ -35,6 +35,45 @@ from model_asfnet import TransformerBlock, load_balancing_loss
 from model_asfnet_br import ASFNetBR
 
 
+class SlotBottleneck(nn.Module):
+    """
+    Perceiver-style resampler: S learned query slots cross-attend over the
+    router's survivor tokens, compressing the image to a FIXED S x D code.
+
+    Contrast with the top-k budget: top-k is selection (attention restricted
+    to one-hot — unselected survivors are discarded outright), slots are
+    superposition (every survivor can contribute to every slot). The rate
+    limit is architectural — S x D numbers reach the decoder no matter how
+    many tokens attend in — so no loss term has to enforce compression and
+    there is no soft/hard threshold seam for SGD to park under.
+    """
+
+    def __init__(self, d_model: int, n_slots: int, num_heads: int,
+                 mlp_ratio: float):
+        super().__init__()
+        self.slots = nn.Parameter(torch.zeros(1, n_slots, d_model))
+        nn.init.normal_(self.slots, std=0.02)
+        self.norm_kv = nn.LayerNorm(d_model)
+        self.attn = nn.MultiheadAttention(d_model, num_heads, batch_first=True)
+        hidden = int(d_model * mlp_ratio)
+        self.norm_mlp = nn.LayerNorm(d_model)
+        self.mlp = nn.Sequential(
+            nn.Linear(d_model, hidden), nn.GELU(), nn.Linear(hidden, d_model),
+        )
+
+    def forward(
+        self,
+        feats:    torch.Tensor,   # (B, K, D) post-norm survivor tokens
+        pad_mask: torch.Tensor,   # (B, K)    True = padding slot
+    ) -> torch.Tensor:            # (B, S, D)
+        kv = self.norm_kv(feats)
+        q = self.slots.expand(feats.shape[0], -1, -1)
+        x, _ = self.attn(q, kv, kv, key_padding_mask=pad_mask,
+                         need_weights=False)
+        x = q + x
+        return x + self.mlp(self.norm_mlp(x))
+
+
 class ASFNetAE(nn.Module):
     def __init__(
         self,
@@ -54,10 +93,14 @@ class ASFNetAE(nn.Module):
         norm_pix_loss:     bool  = True,
         keep_budget:       float = 0.0,
         keep_ratio_target: float = 0.0,
+        xattn_slots:       int   = 0,
     ):
         super().__init__()
         assert (decoder_d_model // decoder_heads) % 4 == 0, \
             "decoder head_dim must be divisible by 4 for 2D RoPE"
+        assert not (keep_budget > 0 and xattn_slots > 0), \
+            "keep_budget (top-k selection) and xattn_slots (slot " \
+            "compression) are alternative bottlenecks — pick one"
 
         self.patch_size    = patch_size
         self.in_channels   = in_channels
@@ -75,8 +118,15 @@ class ASFNetAE(nn.Module):
         #   keep_ratio_target > 0: SOFT pressure — H-Net load-balancing loss
         #                          on the token keep RATE (returned as l_keep;
         #                          the train script weights it).
+        #   xattn_slots > 0:       SLOT bottleneck — S learned queries
+        #                          cross-attend over the survivors; only the
+        #                          S x D code reaches the decoder, which
+        #                          reconstructs ALL patches from it (loss on
+        #                          every position — nothing is copied through,
+        #                          so nothing is trivial).
         self.keep_budget       = keep_budget
         self.keep_ratio_target = keep_ratio_target
+        self.xattn_slots       = xattn_slots
 
         # ---- Encoder: the full retention backbone, no classifier head ----
         self.backbone = ASFNetBR(
@@ -104,6 +154,24 @@ class ASFNetAE(nn.Module):
         ])
         self.decoder_norm = nn.LayerNorm(decoder_d_model)
         self.decoder_pred = nn.Linear(decoder_d_model, patch_size ** 2 * in_channels)
+
+        # ---- Slot-bottleneck extras (only built when active, so topk /
+        # baseline checkpoints keep loading with strict state dicts) ----
+        if xattn_slots > 0:
+            self.slot_bottleneck = SlotBottleneck(
+                d_model, xattn_slots, num_heads, mlp_ratio)
+            # With no survivor tokens placed in the grid, every decoder query
+            # starts as the same mask token — RoPE alone cannot break that
+            # symmetry (identical values pool to identical outputs), so the
+            # queries need an explicit learned position embedding before they
+            # read the slots.
+            self.decoder_pos = nn.Parameter(
+                torch.zeros(1, self.n_patches, decoder_d_model))
+            nn.init.normal_(self.decoder_pos, std=0.02)
+            self.slot_read_norm_q  = nn.LayerNorm(decoder_d_model)
+            self.slot_read_norm_kv = nn.LayerNorm(decoder_d_model)
+            self.slot_read = nn.MultiheadAttention(
+                decoder_d_model, decoder_heads, batch_first=True)
 
     # ------------------------------------------------------------------
     def patchify(self, imgs: torch.Tensor) -> torch.Tensor:
@@ -156,6 +224,35 @@ class ASFNetAE(nn.Module):
             x = block(x, coords)
 
         return self.decoder_pred(self.decoder_norm(x))                     # (B, N, p*p*C)
+
+    # ------------------------------------------------------------------
+    def _decode_slots(
+        self,
+        slot_feats: torch.Tensor,   # (B, S, D) compressed slot code
+    ) -> torch.Tensor:
+        """
+        Perceiver-IO-style decode: N position-embedded mask-token queries
+        cross-attend ONCE to the slot code, then the standard self-attention
+        decoder refines. Slots carry no grid coordinates (they are mixtures,
+        not tokens), so they enter through cross-attention rather than being
+        scattered into the grid.
+        Returns per-patch predictions (B, N, p*p*C).
+        """
+        B = slot_feats.shape[0]
+
+        slots = self.decoder_embed(slot_feats)                # (B, S, dd)
+        x = (self.mask_token + self.decoder_pos).expand(B, -1, -1)
+
+        kv = self.slot_read_norm_kv(slots)
+        r, _ = self.slot_read(self.slot_read_norm_q(x), kv, kv,
+                              need_weights=False)
+        x = x + r
+
+        coords = self.backbone.patch_embed.coords             # (N, 2)
+        for block in self.decoder:
+            x = block(x, coords)
+
+        return self.decoder_pred(self.decoder_norm(x))        # (B, N, p*p*C)
 
     # ------------------------------------------------------------------
     def _apply_budget(
@@ -257,7 +354,10 @@ class ASFNetAE(nn.Module):
             pad_mask, keep = self._apply_budget(pad_mask, sel, keep, s)
             mean_kept = keep.float().sum(dim=1).mean().detach()
 
-        pred = self._decode(feats, pad_mask, sel)          # (B, N, p*p*C)
+        if self.xattn_slots > 0:
+            pred = self._decode_slots(self.slot_bottleneck(feats, pad_mask))
+        else:
+            pred = self._decode(feats, pad_mask, sel)      # (B, N, p*p*C)
 
         target = self.patchify(imgs)                        # (B, N, p*p*C)
         if self.norm_pix_loss:
@@ -267,10 +367,20 @@ class ASFNetAE(nn.Module):
 
         loss_patch = ((pred.float() - target.float()) ** 2).mean(dim=-1)   # (B, N)
 
-        m = (~keep).float()                                 # dropped positions only
-        loss_rec = (loss_patch * m).sum() / m.sum().clamp(min=1.0)
+        if self.xattn_slots > 0:
+            # Slot bottleneck: no position is copied through the decoder, so
+            # EVERY position is graded. (Loss-on-dropped-only here would
+            # re-open the keep-all degeneracy: the router could shrink the
+            # graded set to nothing. The rate limit is architectural, so
+            # grading everything costs the model nothing it can dodge.)
+            loss_rec = loss_patch.mean()
+        else:
+            m = (~keep).float()                             # dropped positions only
+            loss_rec = (loss_patch * m).sum() / m.sum().clamp(min=1.0)
 
-        drop_frac = m.mean().detach()
+        # Router's drop fraction in every mode (in xattn mode it is a
+        # monitoring stat — what the slots could not see — not the loss mask).
+        drop_frac = (~keep).float().mean().detach()
         return loss_rec, l_ratio, l_keep, mean_kept, mean_groups, drop_frac
 
     # ------------------------------------------------------------------
@@ -286,15 +396,24 @@ class ASFNetAE(nn.Module):
             self.backbone.forward_features(imgs)
         if self.keep_budget > 0:
             pad_mask, keep = self._apply_budget(pad_mask, sel, keep, s)
-        pred = self._decode(feats, pad_mask, sel)
+        if self.xattn_slots > 0:
+            pred = self._decode_slots(self.slot_bottleneck(feats, pad_mask))
+        else:
+            pred = self._decode(feats, pad_mask, sel)
         return self.unpatchify(pred.float()), keep
 
     def count_parameters(self) -> dict:
         def n(m): return sum(p.numel() for p in m.parameters())
-        return {
+        counts = {
             "backbone": n(self.backbone),
             "decoder":  n(self.decoder_embed) + n(self.decoder)
                         + n(self.decoder_norm) + n(self.decoder_pred)
                         + self.mask_token.numel(),
-            "total":    n(self),
         }
+        if self.xattn_slots > 0:
+            counts["slot_bneck"] = (n(self.slot_bottleneck) + n(self.slot_read)
+                                    + n(self.slot_read_norm_q)
+                                    + n(self.slot_read_norm_kv)
+                                    + self.decoder_pos.numel())
+        counts["total"] = n(self)
+        return counts
