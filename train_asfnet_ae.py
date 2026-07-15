@@ -350,11 +350,17 @@ def main():
             print(f"  *** New best val rec: {best_val_rec:.4f}")
 
         if args.artifact_every and (epoch + 1) % args.artifact_every == 0:
-            art = wandb.Artifact(f"asfnet-ae-{wandb.run.id}", type="model",
-                                 metadata={"epoch": epoch, "val_rec": val_rec,
-                                           "best_val_rec": best_val_rec})
-            art.add_file(os.path.join(args.checkpoint_dir, "latest.pt"))
-            wandb.log_artifact(art)
+            # Checkpoint backup only — never let a wandb storage blip kill
+            # the training run (their GCS 403'd project-wide 2026-07-15).
+            try:
+                art = wandb.Artifact(f"asfnet-ae-{wandb.run.id}", type="model",
+                                     metadata={"epoch": epoch, "val_rec": val_rec,
+                                               "best_val_rec": best_val_rec})
+                art.add_file(os.path.join(args.checkpoint_dir, "latest.pt"))
+                wandb.log_artifact(art)
+            except Exception as e:
+                print(f"[artifact] upload failed at epoch {epoch + 1}: {e!r} "
+                      f"— continuing")
 
     wandb.finish()
     print(f"\nDone. Best val reconstruction loss: {best_val_rec:.4f}")

@@ -125,7 +125,19 @@ def load_backbone(args, device) -> tuple[ASFNetBR, dict]:
     architecture, and load the pretrained backbone weights into it."""
     if args.ae_artifact:
         art = wandb.use_artifact(args.ae_artifact)
-        ckpt_path = os.path.join(art.download(), "best.pt")
+        # wandb's GCS storage 403s transiently (observed 2026-07-15, took out
+        # two cloud runs at boot) — retry with backoff before giving up.
+        for attempt in range(6):
+            try:
+                ckpt_path = os.path.join(art.download(), "best.pt")
+                break
+            except Exception as e:
+                if attempt == 5:
+                    raise
+                wait = 60 * (attempt + 1)
+                print(f"artifact download failed ({e!r}) — "
+                      f"retry {attempt + 1}/5 in {wait}s")
+                time.sleep(wait)
     elif args.ae_checkpoint:
         ckpt_path = args.ae_checkpoint
     else:
