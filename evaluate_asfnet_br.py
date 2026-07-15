@@ -61,8 +61,7 @@ def _load_model(path: str, device: torch.device, ae: bool):
     a = ckpt["args"]
 
     if ae and a.get("two_stage", False):
-        ae2_cls = ASFNetAE2R if a.get("stage2") == "retain" else ASFNetAE2
-        model = ae2_cls(
+        kw = dict(
             image_size          = a["image_size"],
             patch_size          = a["patch_size"],
             d_model             = a["d_model"],
@@ -79,6 +78,10 @@ def _load_model(path: str, device: torch.device, ae: bool):
             decoder_heads       = a["decoder_heads"],
             norm_pix_loss       = not a.get("no_norm_pix", False),
         )
+        if a.get("stage2") == "retain":
+            model = ASFNetAE2R(**kw, xattn_slots=a.get("xattn_slots", 0))
+        else:
+            model = ASFNetAE2(**kw)
     elif ae:
         model = ASFNetAE(
             image_size        = a["image_size"],

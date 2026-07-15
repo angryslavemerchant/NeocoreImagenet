@@ -48,11 +48,9 @@ def set_seed(seed: int):
 
 def build_model(args):
     if args.two_stage:
-        assert not (args.keep_budget > 0 or args.keep_ratio_target > 0
-                    or args.xattn_slots > 0), \
-            "two_stage has no keep_budget / keep-rate / xattn_slots variant yet"
-        cls = ASFNetAE2R if args.stage2 == "retain" else ASFNetAE2
-        return cls(
+        assert not (args.keep_budget > 0 or args.keep_ratio_target > 0), \
+            "two_stage has no keep_budget / keep-rate variant yet"
+        kw = dict(
             image_size          = args.image_size,
             patch_size          = args.patch_size,
             in_channels         = 3,
@@ -70,6 +68,11 @@ def build_model(args):
             decoder_heads       = args.decoder_heads,
             norm_pix_loss       = not args.no_norm_pix,
         )
+        if args.stage2 == "retain":
+            return ASFNetAE2R(**kw, xattn_slots=args.xattn_slots)
+        assert args.xattn_slots == 0, \
+            "xattn_slots pairs with --stage2 retain (or single-stage), not pool"
+        return ASFNetAE2(**kw)
     return ASFNetAE(
         image_size        = args.image_size,
         patch_size        = args.patch_size,
