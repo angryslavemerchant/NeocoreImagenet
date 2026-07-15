@@ -18,19 +18,37 @@ export DEBIAN_FRONTEND=noninteractive
 INSTANCE_ID="${VAST_CONTAINERLABEL#C.}"
 echo "ONSTART_BEGIN instance=${INSTANCE_ID} $(date -u +%FT%TZ)"
 
+# Resolve the real interpreter: vastai/pytorch images keep the ML stack in
+# /venv/main with no bare `python` on PATH; pytorch/pytorch has `python`.
+if [ -x /venv/main/bin/python ]; then
+    PY=/venv/main/bin/python
+elif command -v python >/dev/null 2>&1; then
+    PY=python
+else
+    PY=python3
+fi
+export PY
+echo "PYTHON=$PY ($($PY --version 2>&1))"
+
+"$PY" -m pip install -q vastai
+# Prefer the CLI we just installed (supports -y); image-bundled ones are old.
+VAST_CLI="$(dirname "$PY")/vastai"
+[ -x "$VAST_CLI" ] || VAST_CLI=vastai
+export VAST_CLI
+
 self_destroy() {
     echo "SELF_DESTROY instance=${INSTANCE_ID}"
     sleep 20   # let the log collector catch the final lines
-    vastai destroy instance "${INSTANCE_ID}" --api-key "${VAST_API_KEY}" -y
+    "$VAST_CLI" destroy instance "${INSTANCE_ID}" --api-key "${VAST_API_KEY}" -y \
+        || echo y | "$VAST_CLI" destroy instance "${INSTANCE_ID}" --api-key "${VAST_API_KEY}"
 }
 
-pip install -q vastai
 command -v tmux >/dev/null 2>&1 || { apt-get update -qq && apt-get install -y -qq tmux; }
 
 # --- Benchmark-only mode: measure, report, self-destroy -------------------
 if [ -n "${BENCH_ONLY:-}" ]; then
-    pip install -q numpy Pillow
-    python vast/benchmark.py --out /workspace/benchmark.json
+    "$PY" -m pip install -q numpy Pillow
+    "$PY" vast/benchmark.py --out /workspace/benchmark.json
     echo "BENCH_ONLY_DONE"
     self_destroy
     exit 0
@@ -38,10 +56,10 @@ fi
 
 # --- Full provisioning -----------------------------------------------------
 echo "INSTALLING_DEPS"
-pip install -q -r requirements.txt
+"$PY" -m pip install -q -r requirements.txt
 
 # --- Health gate: refuse to train on a sick machine -------------------------
-if ! python vast/benchmark.py --gate vast/thresholds.json --out /workspace/benchmark.json; then
+if ! "$PY" vast/benchmark.py --gate vast/thresholds.json --out /workspace/benchmark.json; then
     echo "GATE_FAILED — instance below thresholds, destroying"
     self_destroy
     exit 1

@@ -141,7 +141,15 @@ Porting = copy the folder, edit the table's right column, push, smoke test.
     Hosts pre-cache the official template images, so instances boot in ~1
     min; a cold `pytorch/pytorch` devel pull adds 10-30 min per fresh host
     and is why manual template-based rentals feel much faster.
-15. **Instances can wedge in `created` state and never boot** — e.g.
+15. **`vastai/pytorch` images have no bare `python` on PATH** — the ML stack
+    lives in `/venv/main`. Resolve the interpreter at the top of onstart
+    (`[ -x /venv/main/bin/python ] && PY=/venv/main/bin/python || PY=python3`)
+    and use `$PY` / `$PY -m pip` everywhere. Symptom otherwise:
+    `python: command not found` and a spurious gate failure.
+16. **Image-bundled `vastai` CLIs are old** (no `-y` support). After
+    `$PY -m pip install vastai`, call `$(dirname $PY)/vastai` explicitly,
+    with a `|| echo y | vastai destroy ...` fallback.
+17. **Instances can wedge in `created` state and never boot** — e.g.
     `status_msg: "Error response from daemon: ... OCI runtime create
     failed"` (host kernel/docker incompatibility). No onstart, no logs, no
     self-destroy possible; only `vastai show instance --raw` reveals it.
