@@ -46,6 +46,14 @@ below, then `launch.py launch --offer <ID>`.
   compute); below that, skip.
 - **Internet down**: ≥500 Mbps required (dataset ~13 GB); ≥1 Gbps preferred.
 
+## Known-good machines
+
+- machine 32649 — Alberta, Ryzen 9 9950X3D + RTX PRO 6000 WS, ~$1.10/hr.
+  Ran the full smoke pipeline flawlessly 2026-07-15: boot→gate in ~1 min,
+  best fleet benchmark yet (416 bf16 TFLOPS, 36.9 GB/s H2D, 4.2 GB/s disk,
+  15.8k jpeg/s), full smoke boot→train→eval→upload in ~10 min. First choice
+  when its offers are listed.
+
 ## Known-bad machines (add as found; also `.vast/blacklist.json`)
 
 - machine 14825 — docker daemon broken (OCI runtime create failed), 2026-07-14
