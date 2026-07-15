@@ -198,8 +198,10 @@ def cmd_search(args):
 # ---------------------------------------------------------------------------
 
 def build_onstart(branch: str, train_args: str, bench_only: bool,
-                  keep_alive: bool) -> str:
+                  keep_alive: bool, train_script: str = None) -> str:
     exports = [f"export TRAIN_ARGS='{train_args}'"]
+    if train_script:
+        exports.append(f"export TRAIN_SCRIPT='{train_script}'")
     if bench_only:
         exports.append("export BENCH_ONLY=1")
     if keep_alive:
@@ -223,13 +225,14 @@ def build_onstart(branch: str, train_args: str, bench_only: bool,
 
 def create_instance(offer_id: int, secrets: dict, branch: str,
                     train_args: str, bench_only: bool, keep_alive: bool,
-                    purpose: str) -> int:
+                    purpose: str, train_script: str = None) -> int:
     env = (f"{TEMPLATE_ENV} "
            f"-e WANDB_API_KEY={secrets['WANDB_API_KEY']} "
            f"-e HF_TOKEN={secrets['HF_TOKEN']} "
            f"-e VAST_API_KEY={secrets['VAST_API_KEY']} "
            f"-e WANDB_PROJECT=asfnetAE")
-    onstart = build_onstart(branch, train_args, bench_only, keep_alive)
+    onstart = build_onstart(branch, train_args, bench_only, keep_alive,
+                            train_script)
     result = vast("create", "instance", offer_id,
                   "--image", IMAGE,
                   "--disk", DISK_GB,
@@ -272,7 +275,8 @@ def cmd_launch(args):
 
     iid = create_instance(offer_id, secrets, args.branch, args.train_args,
                           bench_only=False, keep_alive=args.keep_alive,
-                          purpose="smoke" if args.smoke else "train")
+                          purpose="smoke" if args.smoke else "train",
+                          train_script=args.train_script)
     print(f"\nInstance {iid} created.")
     print(f"  watch:   python vast/launch.py logs --id {iid}")
     print(f"  destroy: python vast/launch.py destroy --id {iid}")
@@ -465,6 +469,10 @@ def main():
     sp.add_argument("--offer",      type=int, default=None)
     sp.add_argument("--train-args", type=str, dest="train_args",
                     default="--num_epochs 300 --artifact_every 25")
+    sp.add_argument("--train-script", type=str, dest="train_script",
+                    default=None,
+                    help="Alternative training entry point (e.g. "
+                         "train_linear_probe.py); default is the AE trainer")
     sp.add_argument("--keep-alive", action="store_true", dest="keep_alive")
     sp.add_argument("--smoke",      action="store_true",
                     help="1-epoch pipeline test with keep-alive")

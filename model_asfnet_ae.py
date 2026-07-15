@@ -194,7 +194,7 @@ class ASFNetAE(nn.Module):
     def _keep_rate_loss(
         self,
         probs: torch.Tensor,   # (B, E) soft edge boundary probabilities
-        keep:  torch.Tensor,   # (B, N) hard retention mask (pre-budget)
+        keep:  torch.Tensor,   # (B, N) hard retention mask (unused; see below)
     ) -> torch.Tensor:
         """
         H-Net load-balancing loss on the token keep RATE (not the edge cut
@@ -203,7 +203,15 @@ class ASFNetAE(nn.Module):
         P(>=1 incident cut edge) under edge independence:
             p_keep = 1 - prod_e(1 - p_e)
         which matches border_keep_mask exactly in the hard limit.
-        Minimum (value 1.0) at keep rate == keep_ratio_target.
+
+        F must be the THRESHOLDED version of the same p_keep that G averages
+        — not the actual retention rate. The first ablation used the real
+        keep rate and the router found the loss's degenerate corner: collapse
+        every edge prob to 0, so the zero-border guard keeps all 196 tokens
+        (F=1) while G→0, and (1-F)(1-G) + F·G·(N-1) is exactly 0 there.
+        With F = (p_keep > 0.5) the corners are unreachable/expensive
+        (all-probs-0 costs N/(N-1); keep-all-soft costs ~N) and the only
+        minimum (value 1.0) is at keep rate == keep_ratio_target.
         """
         ei = self.backbone.router.edge_indices
         idx_i, idx_j = ei[:, 0], ei[:, 1]
@@ -214,7 +222,7 @@ class ASFNetAE(nn.Module):
         p_keep = 1.0 - acc.exp()                                    # (B, N)
 
         N_tok  = 1.0 / self.keep_ratio_target
-        F_rate = keep.float().mean().detach()
+        F_rate = (p_keep > 0.5).float().mean().detach()
         G_rate = p_keep.mean()
         return load_balancing_loss(F_rate, G_rate,
                                    torch.as_tensor(N_tok, device=probs.device))

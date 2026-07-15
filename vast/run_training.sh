@@ -19,10 +19,11 @@ VAST_CLI="${VAST_CLI:-vastai}"
 export WANDB_RUN_ID="${WANDB_RUN_ID:-$("$PY" -c 'import wandb.util,sys; sys.stdout.write(wandb.util.generate_id())')}"
 export WANDB_RESUME=allow
 
+TRAIN_SCRIPT="${TRAIN_SCRIPT:-train_asfnet_ae.py}"
 TRAIN_ARGS="${TRAIN_ARGS:---num_epochs 300 --artifact_every 25}"
-echo "TRAIN_START run_id=${WANDB_RUN_ID} args=${TRAIN_ARGS}"
+echo "TRAIN_START script=${TRAIN_SCRIPT} run_id=${WANDB_RUN_ID} args=${TRAIN_ARGS}"
 
-"$PY" train_asfnet_ae.py ${TRAIN_ARGS}
+"$PY" "${TRAIN_SCRIPT}" ${TRAIN_ARGS}
 STATUS=$?
 echo "TRAIN_EXIT status=${STATUS}"
 
@@ -31,17 +32,20 @@ if [ "${STATUS}" -ne 0 ]; then
     exit "${STATUS}"
 fi
 
-# --- Post-training eval: reconstruction + retention visualisations ----------
-echo "EVAL_START"
-"$PY" evaluate_asfnet_br.py --ae \
-    --checkpoint checkpoints_asfnet_ae/best.pt \
-    --output_dir viz_ae || echo "EVAL_FAILED (continuing to upload)"
+# --- AE-only post-processing: eval panels + artifact upload -----------------
+# Other train scripts (e.g. train_linear_probe.py) log everything to wandb
+# themselves and need no separate eval/upload step.
+if [ "${TRAIN_SCRIPT}" = "train_asfnet_ae.py" ]; then
+    echo "EVAL_START"
+    "$PY" evaluate_asfnet_br.py --ae \
+        --checkpoint checkpoints_asfnet_ae/best.pt \
+        --output_dir viz_ae || echo "EVAL_FAILED (continuing to upload)"
 
-# --- Push checkpoints + viz images to wandb ---------------------------------
-"$PY" vast/upload_results.py \
-    --viz_dir viz_ae \
-    --ckpt_dir checkpoints_asfnet_ae \
-    --extra /workspace/benchmark.json || echo "UPLOAD_FAILED"
+    "$PY" vast/upload_results.py \
+        --viz_dir viz_ae \
+        --ckpt_dir checkpoints_asfnet_ae \
+        --extra /workspace/benchmark.json || echo "UPLOAD_FAILED"
+fi
 
 echo "RUN_COMPLETE"
 
