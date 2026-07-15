@@ -1,5 +1,6 @@
 torch>=2.0.0
-torchvision>=0.15.0
+# torchvision intentionally absent: nothing imports it, and installing it
+# can silently replace the cloud image's tuned torch build with PyPI's.
 datasets>=2.14.0
 Pillow>=9.0.0
 tqdm>=4.65.0
