@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+data/
+jpeg_cache/
+checkpoints*/
+viz_*/
+Results/
+wandb/
+
+# Vast.ai automation — never commit these
+vast/secrets.env
+.vast/

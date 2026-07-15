@@ -189,6 +189,10 @@ def main():
     parser.add_argument("--wandb_entity",   type=str, default=None)
     parser.add_argument("--run_name",       type=str, default=None)
     parser.add_argument("--log_interval",   type=int, default=10000)
+    parser.add_argument("--artifact_every", type=int, default=0,
+                        help="Upload latest.pt to wandb as an artifact every "
+                             "N epochs (0 = off). Protects against losing "
+                             "checkpoints when a cloud instance dies.")
     parser.add_argument("--seed",           type=int, default=42)
     parser.add_argument("--device",         type=str, default="cuda")
 
@@ -272,6 +276,13 @@ def main():
             ckpt["best_val_rec"] = best_val_rec
             save_checkpoint(ckpt, os.path.join(args.checkpoint_dir, "best.pt"))
             print(f"  *** New best val rec: {best_val_rec:.4f}")
+
+        if args.artifact_every and (epoch + 1) % args.artifact_every == 0:
+            art = wandb.Artifact(f"asfnet-ae-{wandb.run.id}", type="model",
+                                 metadata={"epoch": epoch, "val_rec": val_rec,
+                                           "best_val_rec": best_val_rec})
+            art.add_file(os.path.join(args.checkpoint_dir, "latest.pt"))
+            wandb.log_artifact(art)
 
     wandb.finish()
     print(f"\nDone. Best val reconstruction loss: {best_val_rec:.4f}")

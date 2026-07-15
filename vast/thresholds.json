@@ -1,0 +1,7 @@
+{
+  "download_mbps": 300,
+  "disk_write_mbps": 150,
+  "cpu_jpeg_per_sec": 250,
+  "pcie_h2d_gbps": 4.0,
+  "gpu_bf16_tflops": 80
+}

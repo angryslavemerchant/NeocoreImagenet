@@ -1,0 +1,38 @@
+# NeocoreImagenet
+
+ASFNet experiments on ImageNet-100 (`clane9/imagenet-100`, auto-downloaded
+from HuggingFace on first run; DALI dataloading via a one-time JPEG cache).
+
+- `train_asfnet*.py` / `model_asfnet*.py` — classification variants
+  (`_br` = border-retention, `2` = two-stage).
+- `*_ae` — self-supervised MAE-style autoencoder on the ASFNetBR backbone.
+  Current research direction. Eval/visualisation: `evaluate_asfnet_br.py --ae`
+  (reconstruction + retention panels); non-AE modes produce chunk-map grids.
+- Training logs to wandb (project `asfnet` for AE).
+
+## Local environment (Windows)
+
+- No `python` on PATH. Use Anaconda explicitly:
+  `& "C:\Users\JmgLi\anaconda3\python.exe"` and
+  `& "C:\Users\JmgLi\anaconda3\Scripts\vastai.exe"`.
+- Training does NOT run locally — it runs on rented Vast.ai GPUs.
+
+## Vast.ai cloud training (see vast/README.md for full runbook)
+
+Everything is driven by `vast/launch.py`:
+
+```powershell
+& "C:\Users\JmgLi\anaconda3\python.exe" vast\launch.py status
+& "C:\Users\JmgLi\anaconda3\python.exe" vast\launch.py launch --smoke
+& "C:\Users\JmgLi\anaconda3\python.exe" vast\launch.py launch   # 300-epoch AE run
+& "C:\Users\JmgLi\anaconda3\python.exe" vast\launch.py logs
+& "C:\Users\JmgLi\anaconda3\python.exe" vast\launch.py destroy  # "kill it"
+```
+
+- Secrets live in `vast/secrets.env` (gitignored — NEVER commit; the repo is
+  public). Instance state in `.vast/instances.json`.
+- Instances health-gate themselves at boot (`vast/benchmark.py` vs
+  `vast/thresholds.json`) and self-destroy when unhealthy or when a run
+  completes successfully. Failed runs keep the instance alive for inspection.
+- The instance clones this repo from GitHub, so cloud-side changes
+  (onstart.sh, thresholds, train args defaults) only take effect after push.
