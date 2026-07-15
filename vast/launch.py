@@ -39,9 +39,10 @@ BLACKLIST = ROOT / ".vast" / "blacklist.json"
 SCAN_OUT  = ROOT / "vast" / "scan_results.json"
 
 REPO_URL  = "https://github.com/angryslavemerchant/NeocoreImagenet.git"
-# Vast's own template image — hosts pre-cache it, so boots take ~1 min
-# instead of a 10-30 min cold DockerHub pull of pytorch/pytorch.
-IMAGE     = "vastai/pytorch:2.6.0-cuda-12.4.1-ipv2"
+# Vast's own template image — hosts pre-cache these, so boots take ~1 min
+# instead of a 10-30 min cold DockerHub pull. cu128 build: required for
+# Blackwell (sm_120 / sm_100); torch 2.9.1 = mature release, low API drift.
+IMAGE     = "vastai/pytorch:2.9.1-cu128-cuda-12.9-mini-py312-2026-06-15"
 DISK_GB   = 80
 
 VASTAI = (shutil.which("vastai")
@@ -125,10 +126,11 @@ def add_to_blacklist(machine_id: int):
 
 
 def search_offers(gpu: str, max_dph: float, inet: int = 500, limit: int = 40):
+    # No reliability filter (user: doesn't matter). cuda>=12.8 for Blackwell.
     query = (f"gpu_name={gpu} num_gpus=1 rentable=true verified=true "
-             f"reliability>0.98 inet_down>={inet} disk_space>={DISK_GB} "
+             f"inet_down>={inet} disk_space>={DISK_GB} "
              f"cpu_cores_effective>=8 cpu_ram>=32 "
-             f"cuda_max_good>=12.0 dph<={max_dph}")
+             f"cuda_max_good>=12.8 dph<={max_dph}")
     offers = vast("search", "offers", query, "-o", "dph")
     if not isinstance(offers, list):
         return []
@@ -429,8 +431,10 @@ def main():
     sub = p.add_subparsers(dest="cmd", required=True)
 
     def common(sp):
-        sp.add_argument("--gpu",     type=str,   default="RTX_4090")
-        sp.add_argument("--max-dph", type=float, default=0.6, dest="max_dph")
+        # RTX 6000 Blackwell workstation cards; B200 for occasional rapid
+        # runs via --gpu B200 (note: B200 market floor may exceed max-dph).
+        sp.add_argument("--gpu",     type=str,   default="RTX_PRO_6000_WS")
+        sp.add_argument("--max-dph", type=float, default=1.2, dest="max_dph")
         sp.add_argument("--inet",    type=int,   default=500)
         sp.add_argument("--branch",  type=str,   default="master")
 

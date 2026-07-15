@@ -30,7 +30,10 @@ import numpy as np
 import torch
 import torch.nn as nn
 import wandb
-from torch.cuda.amp import GradScaler
+try:  # torch >= 2.4 moved GradScaler; torch.cuda.amp variant may be removed
+    from torch.amp import GradScaler
+except ImportError:
+    from torch.cuda.amp import GradScaler
 from tqdm import tqdm
 
 from dataset import get_dataloaders
