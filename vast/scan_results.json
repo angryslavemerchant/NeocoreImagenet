@@ -1,0 +1,43 @@
+[
+  {
+    "instance": 44930900,
+    "dph": 0.373,
+    "timestamp": "2026-07-15T00:12:34Z",
+    "download_error": "HTTP 403 (bench bug, fixed in 0fbddde — instances cloned pre-fix)",
+    "disk_write_mbps": 3295.6,
+    "cpu_cores": 256,
+    "cpu_jpeg_per_sec": 14712.2,
+    "np_gflops": 142.2,
+    "pcie_h2d_gbps": 12.17,
+    "pcie_d2h_gbps": 12.2,
+    "gpu_name": "NVIDIA GeForce RTX 4090",
+    "gpu_bf16_tflops": 110.4
+  },
+  {
+    "instance": 44930901,
+    "dph": 0.369,
+    "timestamp": "2026-07-15T00:13:15Z",
+    "download_error": "HTTP 403 (bench bug, fixed in 0fbddde — instances cloned pre-fix)",
+    "disk_write_mbps": 2661.6,
+    "cpu_cores": 255,
+    "cpu_jpeg_per_sec": 8762.8,
+    "np_gflops": 377.8,
+    "pcie_h2d_gbps": 21.97,
+    "pcie_d2h_gbps": 24.17,
+    "gpu_name": "NVIDIA GeForce RTX 4090",
+    "gpu_bf16_tflops": 162.8
+  },
+  {
+    "instance": 44930891,
+    "dph": 0.334,
+    "timestamp": "2026-07-15T00:13:53Z",
+    "download_error": "HTTP 403 (bench bug, fixed in 0fbddde)",
+    "disk_write_mbps": 796.1,
+    "cpu_cores": 32,
+    "cpu_jpeg_per_sec": 12063.2,
+    "np_gflops": 880.4,
+    "pcie_error": "CUDA Error 804: forward compatibility on unsupported HW — host driver too old for CUDA 12.4 image; GPU unusable",
+    "gpu_error": "same as pcie_error",
+    "note": "would be correctly rejected by the boot gate (missing gpu/pcie metrics fail)"
+  }
+]

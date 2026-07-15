@@ -375,8 +375,10 @@ def cmd_destroy(args):
 
 def main():
     # Windows consoles default to cp1252; instance logs contain UTF-8.
+    # line_buffering so progress is visible when output is redirected.
     if hasattr(sys.stdout, "reconfigure"):
-        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace",
+                               line_buffering=True)
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
