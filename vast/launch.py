@@ -342,9 +342,9 @@ def cmd_status(args):
     for inst in instances:
         iid = inst["id"]
         info = tracked.get(iid, {})
-        print(f"  {iid}  {inst.get('actual_status', '?'):<10} "
-              f"{inst.get('gpu_name', '?'):<14} "
-              f"${inst.get('dph_total', 0):.3f}/hr  "
+        print(f"  {iid}  {inst.get('actual_status') or 'creating':<10} "
+              f"{inst.get('gpu_name') or '?':<14} "
+              f"${inst.get('dph_total') or 0:.3f}/hr  "
               f"purpose={info.get('purpose', 'untracked')}  "
               f"label={inst.get('label') or ''}")
 
