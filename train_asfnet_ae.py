@@ -234,6 +234,10 @@ def main():
     # --- Infrastructure ---
     parser.add_argument("--checkpoint_dir", type=str, default="./checkpoints_asfnet_ae")
     parser.add_argument("--resume",         type=str, default=None)
+    parser.add_argument("--resume_artifact", type=str, default=None,
+                        help="wandb artifact ref to resume from (downloads "
+                             "latest.pt), e.g. asfnetAE/asfnet-ae-<id>:latest. "
+                             "Model args must match the current CLI args.")
     parser.add_argument("--wandb_project",  type=str,
                         default=os.environ.get("WANDB_PROJECT", "asfnetAE"))
     parser.add_argument("--wandb_entity",   type=str, default=None)
@@ -260,6 +264,20 @@ def main():
 
     wandb.init(project=args.wandb_project, entity=args.wandb_entity,
                name=args.run_name, config=vars(args))
+
+    if args.resume_artifact:
+        art = wandb.use_artifact(args.resume_artifact)
+        for attempt in range(6):   # same 403 blips as the probe download
+            try:
+                args.resume = os.path.join(art.download(), "latest.pt")
+                break
+            except Exception as e:
+                if attempt == 5:
+                    raise
+                wait = 60 * (attempt + 1)
+                print(f"resume artifact download failed ({e!r}) — "
+                      f"retry {attempt + 1}/5 in {wait}s")
+                time.sleep(wait)
 
     train_loader, val_loader = get_dataloaders(args)
 
@@ -290,6 +308,11 @@ def main():
     if args.resume:
         start_epoch, best_val_rec, images_seen = load_checkpoint(
             args.resume, model, optimizer, device)
+        # Scheduler state isn't checkpointed — fast-forward it so the LR
+        # continues the cosine decay instead of restarting warmup mid-run.
+        # (Triggers the "step before optimizer.step()" warning; harmless.)
+        for _ in range(start_epoch):
+            scheduler.step()
 
     print(f"\nTraining '{args.run_name}' on {device}  (self-supervised, labels unused)")
     print(f"Epochs: {args.num_epochs}  |  Batch: {args.batch_size}  |  LR: {args.lr}\n")
