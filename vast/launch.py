@@ -193,7 +193,7 @@ def build_onstart(branch: str, train_args: str, bench_only: bool,
     if keep_alive:
         exports.append("export KEEP_ALIVE=1")
     return (
-        "cd /workspace && rm -rf NeocoreImagenet && "
+        "mkdir -p /workspace && cd /workspace && rm -rf NeocoreImagenet && "
         f"git clone -b {branch} {REPO_URL} && "
         "cd NeocoreImagenet && "
         + " && ".join(exports) + " && "

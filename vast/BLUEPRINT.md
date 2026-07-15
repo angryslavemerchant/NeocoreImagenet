@@ -149,7 +149,11 @@ Porting = copy the folder, edit the table's right column, push, smoke test.
 16. **Image-bundled `vastai` CLIs are old** (no `-y` support). After
     `$PY -m pip install vastai`, call `$(dirname $PY)/vastai` explicitly,
     with a `|| echo y | vastai destroy ...` fallback.
-17. **Instances can wedge in `created` state and never boot** — e.g.
+17. **Don't assume `/workspace` exists** — newer vastai image tags
+    (e.g. `cuda-13.2.1-auto`) don't create it, and `cd /workspace && ...`
+    silently kills the whole onstart chain. Always `mkdir -p` first.
+    Symptom: instance `running`, sshd up, zero markers in logs.
+18. **Instances can wedge in `created` state and never boot** — e.g.
     `status_msg: "Error response from daemon: ... OCI runtime create
     failed"` (host kernel/docker incompatibility). No onstart, no logs, no
     self-destroy possible; only `vastai show instance --raw` reveals it.
