@@ -20,6 +20,9 @@ below, then `launch.py launch --offer <ID>`.
    - machine 14825 — docker daemon broken (OCI runtime create failed), 2026-07-14
    - machine 9020  — instances wedge in created/stopped, never boot; ignores
      explicit start, 2026-07-14
+   - machine 34887 — Ryzen 9 9950X, looks great on paper and boots fast, but
+     silently DROPS contracts: accepted twice, instance vanished within ~90s
+     both times (no status, no logs, no billing), 2026-07-14
 4. **PCIe**: gen4 x8 or better preferred; gen3 x8 (~6.5 GB/s) is acceptable
    for this workload (DALI overlaps H2D with compute). Below that, skip.
 5. **Internet down**: ≥500 Mbps required (dataset ~13 GB); ≥1 Gbps preferred.
