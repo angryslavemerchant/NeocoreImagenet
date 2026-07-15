@@ -35,6 +35,7 @@ from pathlib import Path
 ROOT      = Path(__file__).resolve().parent.parent
 SECRETS   = ROOT / "vast" / "secrets.env"
 STATE     = ROOT / ".vast" / "instances.json"
+BLACKLIST = ROOT / ".vast" / "blacklist.json"
 SCAN_OUT  = ROOT / "vast" / "scan_results.json"
 
 REPO_URL  = "https://github.com/angryslavemerchant/NeocoreImagenet.git"
@@ -110,13 +111,49 @@ def resolve_id(args) -> int:
 # Offers
 # ---------------------------------------------------------------------------
 
-def search_offers(gpu: str, max_dph: float, inet: int = 500, limit: int = 20):
+def load_blacklist() -> set:
+    if BLACKLIST.exists():
+        return set(json.loads(BLACKLIST.read_text()))
+    return set()
+
+
+def add_to_blacklist(machine_id: int):
+    bl = load_blacklist()
+    bl.add(machine_id)
+    BLACKLIST.parent.mkdir(exist_ok=True)
+    BLACKLIST.write_text(json.dumps(sorted(bl)))
+
+
+def search_offers(gpu: str, max_dph: float, inet: int = 500, limit: int = 40):
     query = (f"gpu_name={gpu} num_gpus=1 rentable=true verified=true "
              f"reliability>0.98 inet_down>={inet} disk_space>={DISK_GB} "
              f"cpu_cores_effective>=8 cpu_ram>=32 "
              f"cuda_max_good>=12.0 dph<={max_dph}")
     offers = vast("search", "offers", query, "-o", "dph")
-    return offers[:limit] if isinstance(offers, list) else []
+    if not isinstance(offers, list):
+        return []
+    bl = load_blacklist()
+    return [o for o in offers if o.get("machine_id") not in bl][:limit]
+
+
+def _is_server_cpu(o: dict) -> bool:
+    name = (o.get("cpu_name") or "").lower()
+    return "epyc" in name or "xeon" in name
+
+
+def pick_offer(offers: list):
+    """
+    Not the cheapest — the bottom of the price range is where the lemons
+    live (learned the hard way: 3 of the 4 cheapest hosts in a row failed
+    to boot or run CUDA). Pick near the middle of the price distribution,
+    preferring consumer CPUs (Ryzen/Core), which are generally faster per
+    core than the EPYC/Xeon boxes for dataloading.
+    """
+    if not offers:
+        return None
+    median_dph = statistics.median(o["dph_total"] for o in offers)
+    pool = [o for o in offers if not _is_server_cpu(o)] or offers
+    return min(pool, key=lambda o: abs(o["dph_total"] - median_dph))
 
 
 def fmt_offer(o: dict) -> str:
@@ -127,6 +164,8 @@ def fmt_offer(o: dict) -> str:
             f"{o.get('cpu_ram', 0) / 1024:>4.0f} GB RAM  "
             f"pcie x{o.get('pci_gen', '?')}g{o.get('gpu_lanes', '?')}  "
             f"rel {o.get('reliability2', 0):.3f}  "
+            f"m{o.get('machine_id', '?')}  "
+            f"[{o.get('cpu_name', '?')}]  "
             f"({o.get('geolocation', '?')})")
 
 
@@ -201,11 +240,12 @@ def cmd_launch(args):
     offer_id = args.offer
     if offer_id is None:
         offers = search_offers(args.gpu, args.max_dph, args.inet)
-        if not offers:
+        offer = pick_offer(offers)
+        if offer is None:
             sys.exit("No offers matched the filters.")
-        offer_id = offers[0]["id"]
-        print("Selected offer:")
-        print(fmt_offer(offers[0]))
+        offer_id = offer["id"]
+        print("Selected offer (median-price, consumer-CPU preferred):")
+        print(fmt_offer(offer))
 
     iid = create_instance(offer_id, secrets, args.branch, args.train_args,
                           bench_only=False, keep_alive=args.keep_alive,
@@ -244,7 +284,10 @@ def cmd_scan(args):
     if len(offers) < args.n:
         sys.exit(f"Only {len(offers)} offers matched; need {args.n}.")
 
-    # Prefer distinct physical machines for a meaningful sample
+    # Prefer distinct physical machines for a meaningful sample, sampled
+    # around the median price (cheapest offers over-sample lemons).
+    offers.sort(key=lambda o: abs(
+        o["dph_total"] - statistics.median(x["dph_total"] for x in offers)))
     picked, seen_machines = [], set()
     for o in offers:
         m = o.get("machine_id")
@@ -422,6 +465,12 @@ def main():
     sp.add_argument("--id",  type=int, default=None)
     sp.add_argument("--all", action="store_true")
     sp.set_defaults(fn=cmd_destroy)
+
+    sp = sub.add_parser("blacklist",
+                        help="add a machine_id to the do-not-rent list")
+    sp.add_argument("machine_id", type=int)
+    sp.set_defaults(fn=lambda a: (add_to_blacklist(a.machine_id),
+                                  print(f"blacklisted: {sorted(load_blacklist())}")))
 
     args = p.parse_args()
     args.fn(args)

@@ -19,7 +19,10 @@ from HuggingFace on first run; DALI dataloading via a one-time JPEG cache).
 
 ## Vast.ai cloud training (see vast/README.md for full runbook)
 
-Everything is driven by `vast/launch.py`:
+Everything is driven by `vast/launch.py`. **Offer selection is a judgment
+call by the operating agent**: run `search`, apply `vast/OFFER_JUDGEMENT.md`
+(price near the middle of the range, consumer CPUs, known-bad machine list),
+then `launch --offer <ID>`. Auto-pick only as a fallback.
 
 ```powershell
 & "C:\Users\JmgLi\anaconda3\envs\ToastEnv\python.exe" vast\launch.py status
