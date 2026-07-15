@@ -226,7 +226,8 @@ def main():
     parser.add_argument("--jpeg_cache_dir",    type=str, default="./jpeg_cache")
     parser.add_argument("--num_workers",       type=int, default=16)
 
-    parser.add_argument("--checkpoint_dir", type=str, default="./checkpoints_probe")
+    parser.add_argument("--checkpoint_dir", type=str, default=None,
+                        help="default: runs/<run_name> (gitignored)")
     parser.add_argument("--wandb_project",  type=str, default="asfnet")
     parser.add_argument("--run_name",       type=str, default=None)
     parser.add_argument("--image_size",     type=int, default=224)  # dataloader
@@ -241,6 +242,8 @@ def main():
     if auto_name:
         src = args.ae_artifact or os.path.basename(args.ae_checkpoint or "")
         args.run_name = f"probe_{src.split('/')[-1].replace(':', '_')}"
+    if args.checkpoint_dir is None:
+        args.checkpoint_dir = os.path.join("runs", args.run_name)
 
     wandb.init(project=args.wandb_project, name=args.run_name,
                config=vars(args))

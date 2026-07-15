@@ -6,6 +6,7 @@ checkpoints*/
 viz_*/
 Results/
 wandb/
+runs/
 
 # Vast.ai automation — never commit these
 vast/secrets.env

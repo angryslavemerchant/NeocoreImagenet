@@ -32,28 +32,30 @@ if [ "${STATUS}" -ne 0 ]; then
     exit "${STATUS}"
 fi
 
-# --- AE-only post-processing: eval panels + artifact upload -----------------
-# Other train scripts (e.g. train_linear_probe.py) log everything to wandb
-# themselves and need no separate eval/upload step.
+# --- AE-only post-processing: eval panels into the run folder ---------------
+# Other train scripts (e.g. train_linear_probe.py) log metrics to wandb
+# themselves and need no separate eval step. runs/LATEST is written by the
+# train script and points at runs/<run_name>/.
 if [ "${TRAIN_SCRIPT}" = "train_asfnet_ae.py" ]; then
-    echo "EVAL_START"
+    RUN_DIR="$(cat runs/LATEST 2>/dev/null || echo checkpoints_asfnet_ae)"
+    echo "EVAL_START run_dir=${RUN_DIR}"
     "$PY" evaluate_asfnet_br.py --ae \
-        --checkpoint checkpoints_asfnet_ae/best.pt \
-        --output_dir viz_ae || echo "EVAL_FAILED (continuing to upload)"
+        --checkpoint "${RUN_DIR}/best.pt" \
+        --output_dir "${RUN_DIR}/viz" || echo "EVAL_FAILED (continuing to upload)"
 
+    # wandb upload is opportunistic (PNG log + backup artifact) — the local
+    # runs/ folder is the system of record since the 2026-07-15 storage
+    # incident; a wandb failure here must never cost us the run folder.
     "$PY" vast/upload_results.py \
-        --viz_dir viz_ae \
-        --ckpt_dir checkpoints_asfnet_ae \
-        --extra /workspace/benchmark.json || echo "UPLOAD_FAILED"
+        --viz_dir "${RUN_DIR}/viz" \
+        --ckpt_dir "${RUN_DIR}" \
+        --extra /workspace/benchmark.json || echo "UPLOAD_FAILED (results remain on-instance)"
 fi
 
 echo "RUN_COMPLETE"
 
-if [ -z "${KEEP_ALIVE:-}" ]; then
-    echo "SELF_DESTROY instance=${INSTANCE_ID}"
-    sleep 30
-    "$VAST_CLI" destroy instance "${INSTANCE_ID}" --api-key "${VAST_API_KEY}" -y \
-        || echo y | "$VAST_CLI" destroy instance "${INSTANCE_ID}" --api-key "${VAST_API_KEY}"
-else
-    echo "KEEP_ALIVE set — instance left running"
-fi
+# Local-first persistence: do NOT self-destroy — the results live in runs/
+# on this instance until the local orchestrator pulls them:
+#     python vast/launch.py pull --id ${INSTANCE_ID}
+#     python vast/launch.py destroy --id ${INSTANCE_ID}
+echo "AWAITING_PULL instance=${INSTANCE_ID} dir=runs/"

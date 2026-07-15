@@ -14,6 +14,7 @@ Commands:
     status                                           show live instances
     logs     [--id ID] [--tail 120]                  fetch instance logs
     ssh      [--id ID]                               print ssh command
+    pull     [--id ID]                               copy instance runs/ to local
     destroy  [--id ID | --all]                       kill instance(s)
 
 Examples:
@@ -431,6 +432,20 @@ def cmd_ssh(args):
     print(vast("ssh-url", iid, raw=False, check=False).strip())
 
 
+def cmd_pull(args):
+    """Copy the instance's runs/ folder into the local repo's runs/.
+    Instances no longer self-destroy on success — pull, verify, then
+    destroy. Uses `vastai copy` (remote -> local over the Vast copy API)."""
+    iid = resolve_id(args)
+    dst = ROOT / "runs"
+    dst.mkdir(exist_ok=True)
+    src = f"{iid}:/workspace/NeocoreImagenet/runs/"
+    print(f"pulling {src} -> {dst}")
+    out = vast("copy", src, str(dst), raw=False, check=False)
+    print(out)
+    print("verify the folder contents, then: launch.py destroy --id", iid)
+
+
 def cmd_destroy(args):
     if args.all:
         instances = vast("show", "instances")
@@ -493,6 +508,11 @@ def main():
     sp = sub.add_parser("ssh")
     sp.add_argument("--id", type=int, default=None)
     sp.set_defaults(fn=cmd_ssh)
+
+    sp = sub.add_parser("pull",
+                        help="copy the instance's runs/ folder to local runs/")
+    sp.add_argument("--id", type=int, default=None)
+    sp.set_defaults(fn=cmd_pull)
 
     sp = sub.add_parser("destroy")
     sp.add_argument("--id",  type=int, default=None)

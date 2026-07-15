@@ -232,7 +232,10 @@ def main():
     parser.add_argument("--num_workers",       type=int, default=8)
 
     # --- Infrastructure ---
-    parser.add_argument("--checkpoint_dir", type=str, default="./checkpoints_asfnet_ae")
+    parser.add_argument("--checkpoint_dir", type=str, default=None,
+                        help="default: runs/<run_name> — one folder per run "
+                             "(checkpoints + eval viz), gitignored. wandb is "
+                             "logging only; local disk is the system of record.")
     parser.add_argument("--resume",         type=str, default=None)
     parser.add_argument("--resume_artifact", type=str, default=None,
                         help="wandb artifact ref to resume from (downloads "
@@ -261,6 +264,15 @@ def main():
             f"AE_D{args.d_model}_enc{args.encoder_blocks}_main{args.main_blocks}"
             f"_N{args.target_group_size}_dec{args.decoder_d_model}x{args.decoder_blocks}"
         )
+
+    # Per-run local folder (system of record; wandb is logging only).
+    # runs/LATEST points at it so vast/run_training.sh can find best.pt
+    # for the eval step without re-deriving the run name in bash.
+    if args.checkpoint_dir is None:
+        args.checkpoint_dir = os.path.join("runs", args.run_name)
+    os.makedirs("runs", exist_ok=True)
+    with open(os.path.join("runs", "LATEST"), "w") as f:
+        f.write(args.checkpoint_dir)
 
     wandb.init(project=args.wandb_project, entity=args.wandb_entity,
                name=args.run_name, config=vars(args))

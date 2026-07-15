@@ -76,7 +76,13 @@ then `launch --offer <ID>`. Auto-pick only as a fallback.
 - Secrets live in `vast/secrets.env` (gitignored — NEVER commit; the repo is
   public). Instance state in `.vast/instances.json`.
 - Instances health-gate themselves at boot (`vast/benchmark.py` vs
-  `vast/thresholds.json`) and self-destroy when unhealthy or when a run
-  completes successfully. Failed runs keep the instance alive for inspection.
+  `vast/thresholds.json`) and self-destroy when unhealthy. Failed runs keep
+  the instance alive for inspection.
+- **Local-first persistence (since the 2026-07-15 wandb storage outage):**
+  each run writes checkpoints + eval PNGs to `runs/<run_name>/` on the
+  instance (gitignored; `runs/LATEST` points at the newest). wandb is
+  metrics logging only; artifact uploads are opportunistic backups.
+  Successful runs do NOT self-destroy anymore — they print `AWAITING_PULL`;
+  fetch results with `launch.py pull --id <ID>`, verify, then `destroy`.
 - The instance clones this repo from GitHub, so cloud-side changes
   (onstart.sh, thresholds, train args defaults) only take effect after push.

@@ -46,8 +46,12 @@ def main():
         if os.path.exists(path):
             artifact.add_file(path)
     if added:
-        run.log_artifact(artifact, aliases=["final"])
-        print("Checkpoint artifact uploaded")
+        try:
+            run.log_artifact(artifact, aliases=["final"])
+            print("Checkpoint artifact uploaded")
+        except Exception as e:
+            print(f"artifact upload failed ({e!r}) — "
+                  f"checkpoints remain in the local run folder")
 
     run.finish()
 
