@@ -23,11 +23,17 @@ below, then `launch.py launch --offer <ID>`.
 5. **Location**: prefer North America over elsewhere; prefer Canada over the
    US. Subordinate to the CPU preference.
 6. **Container/disk size: 80 GB.**
-7. **Image (user-specified, verbatim): `vastai/pytorch:cuda-13.2.1-auto`.**
-   The Vast.ai pytorch template from DockerHub — its description text is
-   outdated boilerplate (mentions CUDA 10 / pytorch 1.0), ignore that; the
-   image itself is auto-updated (CUDA 13.2, Blackwell-capable, refreshed
-   ~monthly). Do not substitute other tags without asking the user.
+7. **Template (user-specified): the official "PyTorch (Vast)" template**,
+   template_id `2ad6d615db5927a06fef0c9cd51d77c4` — replicated in launch.py
+   from the CLI command the Vast console generates: image
+   `vastai/pytorch:@vastai-automatic-tag` plus the template's port/env
+   config (portal, jupyter, tensorboard), launched `--jupyter --ssh
+   --direct`, with the template's `entrypoint.sh` kept in the foreground
+   and our provisioning chained in the background. Its DockerHub
+   description text is outdated boilerplate (mentions CUDA 10) — ignore;
+   the image is auto-updated and Blackwell-capable. Deviation from the
+   template: disk 80 GB (not 16) per the user's briefing. Do not
+   substitute other images without asking the user.
 
 ## Standing criteria (from operational experience)
 

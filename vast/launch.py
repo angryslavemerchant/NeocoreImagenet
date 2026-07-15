@@ -39,10 +39,22 @@ BLACKLIST = ROOT / ".vast" / "blacklist.json"
 SCAN_OUT  = ROOT / "vast" / "scan_results.json"
 
 REPO_URL  = "https://github.com/angryslavemerchant/NeocoreImagenet.git"
-# USER-SPECIFIED (2026-07-14): the Vast.ai pytorch template, auto-updating
-# CUDA 13.2 build. Its DockerHub description text is outdated boilerplate —
-# the image itself is current (torch + CUDA 13.2, Blackwell-capable).
-IMAGE     = "vastai/pytorch:cuda-13.2.1-auto"
+# USER-SPECIFIED (2026-07-14): the official "PyTorch (Vast)" template
+# (template_id 2ad6d615db5927a06fef0c9cd51d77c4), replicated from the CLI
+# command the Vast console generates. @vastai-automatic-tag lets the host
+# pick its best cached build. TEMPLATE_ENV is the template's own env verbatim.
+IMAGE = "vastai/pytorch:@vastai-automatic-tag"
+TEMPLATE_ENV = (
+    "-p 1111:1111 -p 6006:6006 -p 8080:8080 -p 8384:8384 -p 10100:10100 "
+    "-p 10200:10200 -p 72299:72299 "
+    '-e OPEN_BUTTON_PORT="1111" -e OPEN_BUTTON_TOKEN="1" -e JUPYTER_DIR="/" '
+    '-e DATA_DIRECTORY="/workspace/" '
+    '-e PORTAL_CONFIG="localhost:1111:11111:/:Instance Portal|'
+    "localhost:8080:18080:/:Jupyter|"
+    "localhost:8080:8080:/terminals/1:Jupyter Terminal|"
+    "localhost:8384:18384:/:Syncthing|"
+    'localhost:6006:16006:/:Tensorboard"'
+)
 DISK_GB   = 80
 
 VASTAI = (shutil.which("vastai")
@@ -192,19 +204,25 @@ def build_onstart(branch: str, train_args: str, bench_only: bool,
         exports.append("export BENCH_ONLY=1")
     if keep_alive:
         exports.append("export KEEP_ALIVE=1")
-    return (
+    # Run our provisioning in the background and hand the foreground to the
+    # template's own entrypoint.sh (portal/jupyter/workspace setup) — do NOT
+    # replace it. Our output still reaches `vastai logs` via /proc/1/fd/1.
+    provision = (
         "mkdir -p /workspace && cd /workspace && rm -rf NeocoreImagenet && "
         f"git clone -b {branch} {REPO_URL} && "
         "cd NeocoreImagenet && "
         + " && ".join(exports) + " && "
-        "bash vast/onstart.sh 2>&1 | tee -a /workspace/onstart.log"
+        "bash vast/onstart.sh"
     )
+    return (f"( {provision} ) 2>&1 | tee -a /workspace/onstart.log "
+            "> /proc/1/fd/1 & entrypoint.sh")
 
 
 def create_instance(offer_id: int, secrets: dict, branch: str,
                     train_args: str, bench_only: bool, keep_alive: bool,
                     purpose: str) -> int:
-    env = (f"-e WANDB_API_KEY={secrets['WANDB_API_KEY']} "
+    env = (f"{TEMPLATE_ENV} "
+           f"-e WANDB_API_KEY={secrets['WANDB_API_KEY']} "
            f"-e HF_TOKEN={secrets['HF_TOKEN']} "
            f"-e VAST_API_KEY={secrets['VAST_API_KEY']} "
            f"-e WANDB_PROJECT=asfnet")
@@ -214,7 +232,7 @@ def create_instance(offer_id: int, secrets: dict, branch: str,
                   "--disk", DISK_GB,
                   "--env", env,
                   "--onstart-cmd", onstart,
-                  "--ssh", "--direct")
+                  "--jupyter", "--ssh", "--direct")
     if not isinstance(result, dict) or not result.get("success"):
         raise RuntimeError(f"create instance failed: {result}")
     iid = result["new_contract"]
