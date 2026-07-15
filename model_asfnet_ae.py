@@ -31,7 +31,7 @@ its state dict into a classifier ASFNetBR for linear probing / fine-tuning
 import torch
 import torch.nn as nn
 
-from model_asfnet import TransformerBlock
+from model_asfnet import TransformerBlock, load_balancing_loss
 from model_asfnet_br import ASFNetBR
 
 
@@ -52,6 +52,8 @@ class ASFNetAE(nn.Module):
         decoder_blocks:    int   = 4,
         decoder_heads:     int   = 4,
         norm_pix_loss:     bool  = True,
+        keep_budget:       float = 0.0,
+        keep_ratio_target: float = 0.0,
     ):
         super().__init__()
         assert (decoder_d_model // decoder_heads) % 4 == 0, \
@@ -62,6 +64,19 @@ class ASFNetAE(nn.Module):
         self.grid_size     = image_size // patch_size
         self.n_patches     = self.grid_size ** 2
         self.norm_pix_loss = norm_pix_loss
+
+        # Compression enforcement (see forward): the router alone has no
+        # pressure to compress — with the edge-level ratio target satisfied,
+        # near-zero tokens have interiors, so ~everything is border and kept.
+        #   keep_budget > 0:       HARD cap — at most round(N * keep_budget)
+        #                          survivors (ranked by boundary evidence)
+        #                          enter the decoder; the rest are masked and
+        #                          count as dropped in the loss.
+        #   keep_ratio_target > 0: SOFT pressure — H-Net load-balancing loss
+        #                          on the token keep RATE (returned as l_keep;
+        #                          the train script weights it).
+        self.keep_budget       = keep_budget
+        self.keep_ratio_target = keep_ratio_target
 
         # ---- Encoder: the full retention backbone, no classifier head ----
         self.backbone = ASFNetBR(
@@ -143,6 +158,68 @@ class ASFNetAE(nn.Module):
         return self.decoder_pred(self.decoder_norm(x))                     # (B, N, p*p*C)
 
     # ------------------------------------------------------------------
+    def _apply_budget(
+        self,
+        pad_mask: torch.Tensor,   # (B, K) True = padding slot
+        sel:      torch.Tensor,   # (B, K) original grid index per slot
+        keep:     torch.Tensor,   # (B, N) bool retention mask
+        s:        torch.Tensor,   # (B, N) boundary evidence (ranking key)
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Enforce the keep budget: only the round(N * keep_budget) survivors
+        with the strongest boundary evidence stay; the rest become padding
+        (-> mask token in _decode) and flip to dropped in `keep`, so the
+        reconstruction loss grades them. Selection is hard/detached — same
+        contract as the retention mask itself; placement learns through the
+        confidence residual and the ratio/keep losses, not through top-k.
+        """
+        K_budget = max(1, round(self.n_patches * self.keep_budget))
+        if pad_mask.shape[1] <= K_budget:
+            return pad_mask, keep    # every survivor already fits
+
+        s_slot = s.detach().gather(1, sel)
+        s_slot = s_slot.masked_fill(pad_mask, float("-inf"))
+        top    = s_slot.topk(K_budget, dim=1).indices        # (B, K_budget)
+
+        in_budget = torch.zeros_like(pad_mask)
+        in_budget.scatter_(1, top, True)
+        new_pad = pad_mask | ~in_budget      # pads stay pads even if topk'd
+
+        # sel is a permutation prefix (unique indices), so scatter is exact:
+        # slots surviving the budget mark their grid position kept.
+        new_keep = torch.zeros_like(keep)
+        new_keep.scatter_(1, sel, ~new_pad)
+        return new_pad, new_keep
+
+    def _keep_rate_loss(
+        self,
+        probs: torch.Tensor,   # (B, E) soft edge boundary probabilities
+        keep:  torch.Tensor,   # (B, N) hard retention mask (pre-budget)
+    ) -> torch.Tensor:
+        """
+        H-Net load-balancing loss on the token keep RATE (not the edge cut
+        rate — that one is blind to chunk geometry and is satisfied by
+        keep-everything). Soft keep probability per token is
+        P(>=1 incident cut edge) under edge independence:
+            p_keep = 1 - prod_e(1 - p_e)
+        which matches border_keep_mask exactly in the hard limit.
+        Minimum (value 1.0) at keep rate == keep_ratio_target.
+        """
+        ei = self.backbone.router.edge_indices
+        idx_i, idx_j = ei[:, 0], ei[:, 1]
+
+        log_q = torch.log1p(-probs.float().clamp(max=1.0 - 1e-6))   # log(1-p)
+        acc = log_q.new_zeros(probs.shape[0], self.n_patches)
+        acc = acc.index_add(1, idx_i, log_q).index_add(1, idx_j, log_q)
+        p_keep = 1.0 - acc.exp()                                    # (B, N)
+
+        N_tok  = 1.0 / self.keep_ratio_target
+        F_rate = keep.float().mean().detach()
+        G_rate = p_keep.mean()
+        return load_balancing_loss(F_rate, G_rate,
+                                   torch.as_tensor(N_tok, device=probs.device))
+
+    # ------------------------------------------------------------------
     def forward(
         self,
         imgs: torch.Tensor,
@@ -151,16 +228,26 @@ class ASFNetAE(nn.Module):
         Returns:
             loss_rec:    scalar — MSE on DROPPED patches only
                          (per-patch-normalised targets if norm_pix_loss)
-            l_ratio:     scalar — the backbone's ratio loss (guard rail;
-                         see train script notes on scheduling it down)
+            l_ratio:     scalar — the backbone's edge-level ratio loss
+            l_keep:      scalar — token-level keep-rate loss (zero tensor
+                         when keep_ratio_target == 0)
             mean_kept:   0-dim tensor — avg retained tokens per image
+                         (post-budget when keep_budget > 0)
             mean_groups: 0-dim tensor — avg stage-1 group count
             drop_frac:   0-dim tensor — avg fraction of patches reconstructed
                          (stats stay on GPU; .item() them only when logging,
                          otherwise every step pays a CPU/GPU sync)
         """
-        feats, _, pad_mask, sel, keep, l_ratio, mean_kept, mean_groups = \
+        feats, _, pad_mask, sel, keep, l_ratio, mean_kept, mean_groups, s, probs = \
             self.backbone.forward_features(imgs)
+
+        # Keep-rate loss grades the router's own keep rate (pre-budget).
+        l_keep = self._keep_rate_loss(probs, keep) if self.keep_ratio_target > 0 \
+            else imgs.new_zeros(())
+
+        if self.keep_budget > 0:
+            pad_mask, keep = self._apply_budget(pad_mask, sel, keep, s)
+            mean_kept = keep.float().sum(dim=1).mean().detach()
 
         pred = self._decode(feats, pad_mask, sel)          # (B, N, p*p*C)
 
@@ -176,7 +263,7 @@ class ASFNetAE(nn.Module):
         loss_rec = (loss_patch * m).sum() / m.sum().clamp(min=1.0)
 
         drop_frac = m.mean().detach()
-        return loss_rec, l_ratio, mean_kept, mean_groups, drop_frac
+        return loss_rec, l_ratio, l_keep, mean_kept, mean_groups, drop_frac
 
     # ------------------------------------------------------------------
     @torch.no_grad()
@@ -187,7 +274,10 @@ class ASFNetAE(nn.Module):
         space if norm_pix_loss — visualise per-patch structure, not exact
         colours) and keep is the (B, N) retention mask.
         """
-        feats, _, pad_mask, sel, keep, _, _, _ = self.backbone.forward_features(imgs)
+        feats, _, pad_mask, sel, keep, _, _, _, s, _ = \
+            self.backbone.forward_features(imgs)
+        if self.keep_budget > 0:
+            pad_mask, keep = self._apply_budget(pad_mask, sel, keep, s)
         pred = self._decode(feats, pad_mask, sel)
         return self.unpatchify(pred.float()), keep
 

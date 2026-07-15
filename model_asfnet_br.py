@@ -390,6 +390,11 @@ class ASFNetBR(nn.Module):
                          (both lazy: call .item() only at logging time —
                          an .item() here would force a CPU/GPU sync every
                          training step)
+            s:           (B, N) differentiable per-token boundary evidence
+                         (sum of incident soft edge probs) — the AE's
+                         bottleneck ranks survivors with this
+            probs:       (B, E) soft edge boundary probabilities — the AE's
+                         token-level keep-rate loss is built from these
         """
         tokens, coords = self.patch_embed(x)
         N = tokens.shape[1]
@@ -425,13 +430,14 @@ class ASFNetBR(nn.Module):
         mean_kept   = n_keep.float().mean().detach()
         mean_groups = (group_ids.max(dim=1).values + 1).float().mean().detach()
 
-        return tok_c, coord_c, pad_mask, sel, keep, l_ratio, mean_kept, mean_groups
+        return tok_c, coord_c, pad_mask, sel, keep, l_ratio, mean_kept, mean_groups, s, probs
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, float, float]:
         """
         Returns: logits, l_ratio, mean_kept, mean_groups
         """
-        feats, _, pad_mask, _, _, l_ratio, mean_kept, mean_groups = self.forward_features(x)
+        feats, _, pad_mask, _, _, l_ratio, mean_kept, mean_groups, _s, _probs = \
+            self.forward_features(x)
 
         real_mask   = (~pad_mask).float()
         token_sum   = (feats * real_mask.unsqueeze(-1)).sum(dim=1)

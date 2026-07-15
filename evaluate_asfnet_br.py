@@ -74,6 +74,8 @@ def _load_model(path: str, device: torch.device, ae: bool):
             decoder_blocks    = a["decoder_blocks"],
             decoder_heads     = a["decoder_heads"],
             norm_pix_loss     = not a.get("no_norm_pix", False),
+            keep_budget       = a.get("keep_budget", 0.0),
+            keep_ratio_target = a.get("keep_ratio_target", 0.0),
         )
     elif a.get("two_stage", False):
         model = ASFNetBR2(

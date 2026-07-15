@@ -53,6 +53,10 @@ below, then `launch.py launch --offer <ID>`.
   best fleet benchmark yet (416 bf16 TFLOPS, 36.9 GB/s H2D, 4.2 GB/s disk,
   15.8k jpeg/s), full smoke boot→train→eval→upload in ~10 min. First choice
   when its offers are listed.
+- machine 36615 — Alberta, Core Ultra 7 265K + RTX PRO 6000 WS. Benchmarked
+  superbly (384 TFLOPS bf16, 12.8k jpeg/s). Was briefly suspected of
+  dropping a contract on 2026-07-15 — that instance was actually STOPPED
+  MANUALLY BY THE USER; the machine is fine. Good second choice.
 
 ## Known-bad machines (add as found; also `.vast/blacklist.json`)
 
@@ -62,10 +66,6 @@ below, then `launch.py launch --offer <ID>`.
 - machine 34887 — Ryzen 9 9950X 4090, looks great on paper, boots fast, but
   silently DROPS contracts: accepted twice, instance vanished within ~90s
   both times (no status, no logs, no billing), 2026-07-14
-- machine 36615 — Alberta, Core Ultra 7 265K + RTX PRO 6000 WS. Benchmarked
-  superbly once (384 TFLOPS bf16), but then dropped a running contract ~8
-  min into provisioning (instance vanished from the API mid-benchmark),
-  2026-07-15. One strike — retry-worthy later, but not twice in a row.
 
 ## Post-boot judgment
 

@@ -61,6 +61,8 @@ def build_model(args) -> ASFNetAE:
         decoder_blocks    = args.decoder_blocks,
         decoder_heads     = args.decoder_heads,
         norm_pix_loss     = not args.no_norm_pix,
+        keep_budget       = args.keep_budget,
+        keep_ratio_target = args.keep_ratio_target,
     )
 
 
@@ -92,6 +94,7 @@ def run_epoch(model, loader, optimizer, args, epoch, device,
     # pipeline, which dominates step time for a model this small.
     rec_losses   = AverageMeter()
     ratio_losses = AverageMeter()
+    keep_losses  = AverageMeter()
     kept         = AverageMeter()
     dropf        = AverageMeter()
 
@@ -112,8 +115,11 @@ def run_epoch(model, loader, optimizer, args, epoch, device,
             B = images.size(0)
 
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                loss_rec, l_ratio, mean_kept, _mean_groups, drop_frac = model(images)
-                loss = loss_rec + args.ratio_loss_weight * l_ratio
+                loss_rec, l_ratio, l_keep, mean_kept, _mean_groups, drop_frac = \
+                    model(images)
+                loss = (loss_rec
+                        + args.ratio_loss_weight * l_ratio
+                        + args.keep_loss_weight * l_keep)
 
             if train:
                 optimizer.zero_grad()
@@ -123,6 +129,7 @@ def run_epoch(model, loader, optimizer, args, epoch, device,
 
             rec_losses.update(loss_rec.detach(), B)
             ratio_losses.update(l_ratio.detach(), B)
+            keep_losses.update(l_keep.detach(), B)
             kept.update(mean_kept, B)
             dropf.update(drop_frac, B)
             n_images      += B
@@ -140,6 +147,7 @@ def run_epoch(model, loader, optimizer, args, epoch, device,
                     wandb.log({
                         "train/rec_loss":    float(rec_losses.avg),
                         "train/ratio_loss":  float(ratio_losses.avg),
+                        "train/keep_loss":   float(keep_losses.avg),
                         "train/mean_kept":   float(kept.avg),
                         "train/drop_frac":   float(dropf.avg),
                         "train/images_seen": images_seen,
@@ -158,6 +166,7 @@ def run_epoch(model, loader, optimizer, args, epoch, device,
         wandb.log({
             "val/rec_loss":   float(rec_losses.avg),
             "val/ratio_loss": float(ratio_losses.avg),
+            "val/keep_loss":  float(keep_losses.avg),
             "val/mean_kept":  float(kept.avg),
             "val/drop_frac":  float(dropf.avg),
         }, step=global_step)
@@ -195,6 +204,19 @@ def main():
     parser.add_argument("--grad_clip",         type=float, default=1.0)
     parser.add_argument("--warmup_epochs",     type=int,   default=10)
     parser.add_argument("--ratio_loss_weight", type=float, default=0.03)
+
+    # --- Compression enforcement (ablations; both default OFF) ---
+    parser.add_argument("--keep_budget", type=float, default=0.0,
+                        help="Hard bottleneck: max fraction of patches that "
+                             "may enter the decoder (top-k by boundary "
+                             "evidence); the rest are masked + reconstructed. "
+                             "e.g. 0.25. 0 = off.")
+    parser.add_argument("--keep_ratio_target", type=float, default=0.0,
+                        help="Token-level keep-rate target for the H-Net "
+                             "loss on keep fraction (e.g. 0.25). 0 = off.")
+    parser.add_argument("--keep_loss_weight", type=float, default=0.03,
+                        help="Weight on the token-level keep-rate loss "
+                             "(only active with --keep_ratio_target > 0).")
 
     # --- Data ---
     parser.add_argument("--dataset_name",      type=str, default="clane9/imagenet-100")
