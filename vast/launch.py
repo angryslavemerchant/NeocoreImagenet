@@ -38,7 +38,9 @@ STATE     = ROOT / ".vast" / "instances.json"
 SCAN_OUT  = ROOT / "vast" / "scan_results.json"
 
 REPO_URL  = "https://github.com/angryslavemerchant/NeocoreImagenet.git"
-IMAGE     = "pytorch/pytorch:2.5.1-cuda12.4-cudnn9-devel"
+# Vast's own template image — hosts pre-cache it, so boots take ~1 min
+# instead of a 10-30 min cold DockerHub pull of pytorch/pytorch.
+IMAGE     = "vastai/pytorch:2.6.0-cuda-12.4.1-ipv2"
 DISK_GB   = 80
 
 VASTAI = (shutil.which("vastai")

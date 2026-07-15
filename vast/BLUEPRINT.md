@@ -136,7 +136,12 @@ Porting = copy the folder, edit the table's right column, push, smoke test.
     PID 1's stdout). Pipe the tmux payload through
     `tee /workspace/train.log >> /proc/1/fd/1` so remote log polling can see
     training markers too.
-14. **Instances can wedge in `created` state and never boot** — e.g.
+14. **Use Vast's own template images** (`vastai/pytorch:<tag>` — find current
+    tags via `vastai search templates --raw`), not vanilla DockerHub images.
+    Hosts pre-cache the official template images, so instances boot in ~1
+    min; a cold `pytorch/pytorch` devel pull adds 10-30 min per fresh host
+    and is why manual template-based rentals feel much faster.
+15. **Instances can wedge in `created` state and never boot** — e.g.
     `status_msg: "Error response from daemon: ... OCI runtime create
     failed"` (host kernel/docker incompatibility). No onstart, no logs, no
     self-destroy possible; only `vastai show instance --raw` reveals it.
