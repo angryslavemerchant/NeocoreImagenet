@@ -12,9 +12,9 @@ from HuggingFace on first run; DALI dataloading via a one-time JPEG cache).
 
 ## Local environment (Windows)
 
-- No `python` on PATH. Use Anaconda explicitly:
-  `& "C:\Users\JmgLi\anaconda3\python.exe"` and
-  `& "C:\Users\JmgLi\anaconda3\Scripts\vastai.exe"`.
+- No `python` on PATH. The project env is the `ToastEnv` conda env:
+  `& "C:\Users\JmgLi\anaconda3\envs\ToastEnv\python.exe"` and
+  `& "C:\Users\JmgLi\anaconda3\envs\ToastEnv\Scripts\vastai.exe"`.
 - Training does NOT run locally — it runs on rented Vast.ai GPUs.
 
 ## Vast.ai cloud training (see vast/README.md for full runbook)
@@ -22,11 +22,11 @@ from HuggingFace on first run; DALI dataloading via a one-time JPEG cache).
 Everything is driven by `vast/launch.py`:
 
 ```powershell
-& "C:\Users\JmgLi\anaconda3\python.exe" vast\launch.py status
-& "C:\Users\JmgLi\anaconda3\python.exe" vast\launch.py launch --smoke
-& "C:\Users\JmgLi\anaconda3\python.exe" vast\launch.py launch   # 300-epoch AE run
-& "C:\Users\JmgLi\anaconda3\python.exe" vast\launch.py logs
-& "C:\Users\JmgLi\anaconda3\python.exe" vast\launch.py destroy  # "kill it"
+& "C:\Users\JmgLi\anaconda3\envs\ToastEnv\python.exe" vast\launch.py status
+& "C:\Users\JmgLi\anaconda3\envs\ToastEnv\python.exe" vast\launch.py launch --smoke
+& "C:\Users\JmgLi\anaconda3\envs\ToastEnv\python.exe" vast\launch.py launch   # 300-epoch AE run
+& "C:\Users\JmgLi\anaconda3\envs\ToastEnv\python.exe" vast\launch.py logs
+& "C:\Users\JmgLi\anaconda3\envs\ToastEnv\python.exe" vast\launch.py destroy  # "kill it"
 ```
 
 - Secrets live in `vast/secrets.env` (gitignored — NEVER commit; the repo is

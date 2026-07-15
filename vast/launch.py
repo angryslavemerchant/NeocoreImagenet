@@ -42,7 +42,7 @@ IMAGE     = "pytorch/pytorch:2.5.1-cuda12.4-cudnn9-devel"
 DISK_GB   = 80
 
 VASTAI = (shutil.which("vastai")
-          or r"C:\Users\JmgLi\anaconda3\Scripts\vastai.exe")
+          or r"C:\Users\JmgLi\anaconda3\envs\ToastEnv\Scripts\vastai.exe")
 
 
 # ---------------------------------------------------------------------------
