@@ -111,7 +111,7 @@ def resolve_id(args) -> int:
 def search_offers(gpu: str, max_dph: float, inet: int = 500, limit: int = 20):
     query = (f"gpu_name={gpu} num_gpus=1 rentable=true verified=true "
              f"reliability>0.98 inet_down>={inet} disk_space>={DISK_GB} "
-             f"cpu_cores_effective>=8 cpu_ram>=32000 "
+             f"cpu_cores_effective>=8 cpu_ram>=32 "
              f"cuda_max_good>=12.0 dph<={max_dph}")
     offers = vast("search", "offers", query, "-o", "dph")
     return offers[:limit] if isinstance(offers, list) else []
