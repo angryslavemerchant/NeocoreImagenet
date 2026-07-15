@@ -31,9 +31,9 @@ import urllib.request
 _UA = {"User-Agent": "Mozilla/5.0 (vast-bench)"}
 
 
-def _timed_read(url: str, size_mb: int) -> tuple[int, float]:
+def _timed_read(url: str, size_mb: int, headers: dict = None) -> tuple[int, float]:
     """Read up to size_mb from url, return (bytes, seconds)."""
-    req = urllib.request.Request(url, headers=_UA)
+    req = urllib.request.Request(url, headers={**_UA, **(headers or {})})
     t0 = time.perf_counter()
     n = 0
     with urllib.request.urlopen(req, timeout=120) as r:
@@ -51,24 +51,35 @@ def bench_download(size_mb: int = 200) -> dict:
     training dataset, i.e. exactly the path the dataset download takes.
     Falls back to Cloudflare's speed-test endpoint.
     """
+    # HF increasingly requires auth from datacenter IPs — use the token the
+    # instance already has. Cloudflare's speed endpoint 403s DC ranges, so
+    # OVH's public test file is the anonymous fallback.
+    hf_auth = {}
+    token = os.environ.get("HF_TOKEN")
+    if token:
+        hf_auth = {"Authorization": f"Bearer {token}"}
+
     urls = []
     try:
         api = ("https://huggingface.co/api/datasets/clane9/imagenet-100/"
                "parquet/default/train")
         with urllib.request.urlopen(
-                urllib.request.Request(api, headers=_UA), timeout=30) as r:
+                urllib.request.Request(api, headers={**_UA, **hf_auth}),
+                timeout=30) as r:
             shard_urls = json.load(r)
         if shard_urls:
-            urls.append(("hf", shard_urls[0]))
+            urls.append(("hf", shard_urls[0], hf_auth))
     except Exception:
         pass
+    urls.append(("ovh", "https://proof.ovh.net/files/1Gb.dat", {}))
     urls.append(("cloudflare",
-                 f"https://speed.cloudflare.com/__down?bytes={size_mb * (1 << 20)}"))
+                 f"https://speed.cloudflare.com/__down?bytes={size_mb * (1 << 20)}",
+                 {}))
 
     last_err: Exception = RuntimeError("no download source available")
-    for src, url in urls:
+    for src, url, headers in urls:
         try:
-            n, dt = _timed_read(url, size_mb)
+            n, dt = _timed_read(url, size_mb, headers)
             if n < 10 * (1 << 20):
                 raise RuntimeError(f"only {n} bytes from {src}")
             return {"download_mbps": round(n * 8 / 1e6 / dt, 1),
