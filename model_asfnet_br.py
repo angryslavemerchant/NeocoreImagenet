@@ -547,14 +547,26 @@ class ASFNetBR2(nn.Module):
         ])
 
         self.norm       = nn.LayerNorm(d_model)
-        self.classifier = nn.Linear(d_model, num_classes)
+        self.classifier = nn.Linear(d_model, num_classes) if num_classes > 0 else None
 
-    def forward(
-        self,
-        x: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, float, float]:
+    def forward_features(self, x: torch.Tensor):
         """
-        Returns: logits, l_ratio1, l_ratio2, mean_kept1, mean_groups2
+        Everything up to (and including) the post-norm stage-2 group tokens —
+        the two-stage counterpart of ASFNetBR.forward_features, exposed for
+        the autoencoder (ASFNetAE2).
+
+        Returns:
+            feats2:      (B, max_G, D) post-norm stage-2 group tokens
+            coords2:     (B, max_G, 2) group centroid coords
+            pad_mask2:   (B, max_G) True = padding / trash group
+            group_ids2:  (B, N) contiguous stage-2 group id per grid position
+                         (dropped tokens share the trash group)
+            keep1:       (B, N) bool stage-1 retention mask
+            l_ratio1, l_ratio2: scalar router losses
+            mean_kept1:   0-dim GPU tensor — avg stage-1 survivors
+            mean_groups2: 0-dim GPU tensor — avg real stage-2 groups
+            s1:          (B, N) differentiable stage-1 boundary evidence
+            probs1:      (B, E) stage-1 soft edge probabilities
         """
         B = x.shape[0]
 
@@ -605,23 +617,37 @@ class ASFNetBR2(nn.Module):
         real_sum.scatter_add_(1, group_ids2.clamp(0, max_G2 - 1), keep1.float())
         pad_mask2 = real_sum < 0.5
 
-        # ---- Main network + classifier ----
+        # ---- Main network over group tokens ----
         for block in self.main_net:
             padded2 = block(padded2, coords2, pad_mask2)
 
         padded2 = self.norm(padded2)
 
+        mean_kept1   = keep1.float().sum(dim=1).mean().detach()
+        mean_groups2 = (~pad_mask2).sum(dim=1).float().mean().detach()
+
+        return (padded2, coords2, pad_mask2, group_ids2, keep1,
+                l_ratio1, l_ratio2, mean_kept1, mean_groups2, s1, probs1)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, float, float]:
+        """
+        Returns: logits, l_ratio1, l_ratio2, mean_kept1, mean_groups2
+        """
+        feats2, _, pad_mask2, _, _, l_ratio1, l_ratio2, mean_kept1, \
+            mean_groups2, _s1, _probs1 = self.forward_features(x)
+
         real_mask   = (~pad_mask2).float()
-        token_sum   = (padded2 * real_mask.unsqueeze(-1)).sum(dim=1)
+        token_sum   = (feats2 * real_mask.unsqueeze(-1)).sum(dim=1)
         token_count = real_mask.sum(dim=1, keepdim=True).clamp(min=1)
         pooled      = token_sum / token_count
 
         logits = self.classifier(pooled)
 
-        mean_kept1   = float(keep1.float().sum(dim=1).mean().item())
-        mean_groups2 = float((~pad_mask2).sum(dim=1).float().mean().item())
-
-        return logits, l_ratio1, l_ratio2, mean_kept1, mean_groups2
+        return logits, l_ratio1, l_ratio2, \
+            float(mean_kept1.item()), float(mean_groups2.item())
 
     def count_parameters(self) -> dict:
         def n(m): return sum(p.numel() for p in m.parameters())

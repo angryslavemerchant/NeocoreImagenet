@@ -35,6 +35,7 @@ from tqdm import tqdm
 
 from dataset import get_dataloaders
 from model_asfnet_ae import ASFNetAE
+from model_asfnet_ae2 import ASFNetAE2
 from utils import AverageMeter
 
 
@@ -45,7 +46,29 @@ def set_seed(seed: int):
     torch.cuda.manual_seed_all(seed)
 
 
-def build_model(args) -> ASFNetAE:
+def build_model(args):
+    if args.two_stage:
+        assert not (args.keep_budget > 0 or args.keep_ratio_target > 0
+                    or args.xattn_slots > 0), \
+            "two_stage has no keep_budget / keep-rate / xattn_slots variant yet"
+        return ASFNetAE2(
+            image_size          = args.image_size,
+            patch_size          = args.patch_size,
+            in_channels         = 3,
+            d_model             = args.d_model,
+            num_heads           = args.num_heads,
+            encoder1_blocks     = args.encoder_blocks,
+            encoder2_blocks     = args.encoder2_blocks,
+            main_blocks         = args.main_blocks,
+            mlp_ratio           = args.mlp_ratio,
+            target_group_size_1 = args.target_group_size,
+            target_group_size_2 = args.target_group_size_2,
+            router_proj_dim     = args.router_proj_dim,
+            decoder_d_model     = args.decoder_d_model,
+            decoder_blocks      = args.decoder_blocks,
+            decoder_heads       = args.decoder_heads,
+            norm_pix_loss       = not args.no_norm_pix,
+        )
     return ASFNetAE(
         image_size        = args.image_size,
         patch_size        = args.patch_size,
@@ -97,6 +120,7 @@ def run_epoch(model, loader, optimizer, args, epoch, device,
     ratio_losses = AverageMeter()
     keep_losses  = AverageMeter()
     kept         = AverageMeter()
+    groups       = AverageMeter()
     dropf        = AverageMeter()
 
     tag  = "train" if train else "val"
@@ -116,7 +140,7 @@ def run_epoch(model, loader, optimizer, args, epoch, device,
             B = images.size(0)
 
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                loss_rec, l_ratio, l_keep, mean_kept, _mean_groups, drop_frac = \
+                loss_rec, l_ratio, l_keep, mean_kept, mean_groups, drop_frac = \
                     model(images)
                 loss = (loss_rec
                         + args.ratio_loss_weight * l_ratio
@@ -132,6 +156,7 @@ def run_epoch(model, loader, optimizer, args, epoch, device,
             ratio_losses.update(l_ratio.detach(), B)
             keep_losses.update(l_keep.detach(), B)
             kept.update(mean_kept, B)
+            groups.update(mean_groups, B)
             dropf.update(drop_frac, B)
             n_images      += B
             step_in_epoch += 1
@@ -150,6 +175,7 @@ def run_epoch(model, loader, optimizer, args, epoch, device,
                         "train/ratio_loss":  float(ratio_losses.avg),
                         "train/keep_loss":   float(keep_losses.avg),
                         "train/mean_kept":   float(kept.avg),
+                        "train/mean_groups": float(groups.avg),
                         "train/drop_frac":   float(dropf.avg),
                         "train/images_seen": images_seen,
                     }, step=global_step)
@@ -169,6 +195,7 @@ def run_epoch(model, loader, optimizer, args, epoch, device,
             "val/ratio_loss": float(ratio_losses.avg),
             "val/keep_loss":  float(keep_losses.avg),
             "val/mean_kept":  float(kept.avg),
+            "val/mean_groups": float(groups.avg),
             "val/drop_frac":  float(dropf.avg),
         }, step=global_step)
 
@@ -188,6 +215,15 @@ def main():
     parser.add_argument("--mlp_ratio",         type=float, default=3.0)
     parser.add_argument("--target_group_size", type=float, default=3.0)
     parser.add_argument("--router_proj_dim",   type=int,   default=64)
+
+    # --- Two-stage backbone (ASFNetAE2: retention, then group + pool) ---
+    parser.add_argument("--two_stage", action="store_true",
+                        help="Use the two-stage backbone (ASFNetBR2): stage-1 "
+                             "border retention, stage-2 grid-adjacent grouping "
+                             "+ pooled group tokens into the decoder. "
+                             "--encoder_blocks is stage 1's depth.")
+    parser.add_argument("--encoder2_blocks",     type=int,   default=3)
+    parser.add_argument("--target_group_size_2", type=float, default=3.0)
 
     # --- Decoder (MAE-style: narrower + shallower than encoder) ---
     parser.add_argument("--decoder_d_model", type=int, default=128)

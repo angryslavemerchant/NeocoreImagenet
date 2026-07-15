@@ -41,6 +41,7 @@ from model_asfnet_br import (
 )
 from model_asfnet import gpu_connected_components
 from model_asfnet_ae import ASFNetAE
+from model_asfnet_ae2 import ASFNetAE2
 
 # Reuse the existing viz primitives — evaluate_asfnet2 guards its main().
 from evaluate_asfnet2 import (
@@ -59,7 +60,25 @@ def _load_model(path: str, device: torch.device, ae: bool):
     ckpt = torch.load(path, map_location=device, weights_only=True)
     a = ckpt["args"]
 
-    if ae:
+    if ae and a.get("two_stage", False):
+        model = ASFNetAE2(
+            image_size          = a["image_size"],
+            patch_size          = a["patch_size"],
+            d_model             = a["d_model"],
+            num_heads           = a["num_heads"],
+            encoder1_blocks     = a["encoder_blocks"],
+            encoder2_blocks     = a["encoder2_blocks"],
+            main_blocks         = a["main_blocks"],
+            mlp_ratio           = a["mlp_ratio"],
+            target_group_size_1 = a["target_group_size"],
+            target_group_size_2 = a["target_group_size_2"],
+            router_proj_dim     = a["router_proj_dim"],
+            decoder_d_model     = a["decoder_d_model"],
+            decoder_blocks      = a["decoder_blocks"],
+            decoder_heads       = a["decoder_heads"],
+            norm_pix_loss       = not a.get("no_norm_pix", False),
+        )
+    elif ae:
         model = ASFNetAE(
             image_size        = a["image_size"],
             patch_size        = a["patch_size"],
