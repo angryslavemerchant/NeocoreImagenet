@@ -208,13 +208,16 @@ def build_onstart(branch: str, train_args: str, bench_only: bool,
     # template's own entrypoint.sh (portal/jupyter/workspace setup) — do NOT
     # replace it. Our output still reaches `vastai logs` via /proc/1/fd/1.
     provision = (
-        "mkdir -p /workspace && cd /workspace && rm -rf NeocoreImagenet && "
+        "cd /workspace && rm -rf NeocoreImagenet && "
         f"git clone -b {branch} {REPO_URL} && "
         "cd NeocoreImagenet && "
         + " && ".join(exports) + " && "
         "bash vast/onstart.sh"
     )
-    return (f"( {provision} ) 2>&1 | tee -a /workspace/onstart.log "
+    # mkdir BEFORE the pipeline: tee opens its log file at pipeline start,
+    # and a missing /workspace kills the whole provision chain via SIGPIPE.
+    return ("mkdir -p /workspace; "
+            f"( {provision} ) 2>&1 | tee -a /workspace/onstart.log "
             "> /proc/1/fd/1 & entrypoint.sh")
 
 
