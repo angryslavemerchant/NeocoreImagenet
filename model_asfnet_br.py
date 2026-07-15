@@ -462,6 +462,205 @@ class ASFNetBR(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# ASFNetBR2R — two-stage DOUBLE retention: border-keep at BOTH stages
+# ---------------------------------------------------------------------------
+
+def masked_border_keep(
+    hard:         torch.Tensor,   # (B, E) hard decisions
+    valid:        torch.Tensor,   # (B, E) both-endpoints-retained mask
+    edge_indices: torch.Tensor,   # (E, 2)
+    n_tokens:     int,
+    keep_prev:    torch.Tensor,   # (B, N) stage-1 retention
+) -> torch.Tensor:
+    """
+    Stage-2 analogue of border_keep_mask, restricted to valid
+    (survivor-survivor) edges: keep a survivor iff it has >=1 incident valid
+    cut edge OR it is an island (no valid edges at all — the survivor-graph
+    singleton chunk, all-border by the same argument as stage 1's singletons).
+    Returns (B, N) bool, always a subset of keep_prev.
+    """
+    idx_i, idx_j = edge_indices[:, 0], edge_indices[:, 1]
+    valid_f = valid.float()
+
+    cut = (hard.detach() * valid_f)
+    cuts_per_tok = cut.new_zeros(cut.shape[0], n_tokens)
+    cuts_per_tok = cuts_per_tok.index_add(1, idx_i, cut).index_add(1, idx_j, cut)
+
+    valid_per_tok = valid_f.new_zeros(valid_f.shape[0], n_tokens)
+    valid_per_tok = valid_per_tok.index_add(1, idx_i, valid_f).index_add(1, idx_j, valid_f)
+
+    border = cuts_per_tok > 0.5
+    island = valid_per_tok < 0.5
+    return keep_prev & (border | island)
+
+
+class ASFNetBR2R(nn.Module):
+    """
+    Two-stage border-retention ASFNet where stage 2 is ALSO retention —
+    no pooling anywhere. Stage 1 drops the interiors of fine chunks;
+    stage 2 routes the survivor subgraph into coarser chunks and drops
+    THEIR interiors. Every surviving token keeps its exact grid coordinate
+    all the way into the main network (and, in the AE, into the decoder).
+
+    Gradient paths mirror stage 1's: each router reaches the loss through
+    its own confidence residual (s = sum of incident soft probs on that
+    stage's routable edges); retention masks are hard/detached routing facts.
+
+    Compression is compound: keep2 ⊆ keep1. The known failure mode is the
+    same keep-everything corner as the single-stage AE — with small target
+    group sizes almost every token is some chunk's border. Whether the
+    coarser stage-2 chunks develop real interiors (and therefore real drops)
+    is exactly what the AE experiment observes; watch mean_kept2 vs
+    mean_kept1.
+    """
+
+    def __init__(
+        self,
+        image_size:          int   = 224,
+        patch_size:          int   = 16,
+        in_channels:         int   = 3,
+        d_model:             int   = 256,
+        num_heads:           int   = 8,
+        encoder1_blocks:     int   = 3,
+        encoder2_blocks:     int   = 3,
+        main_blocks:         int   = 6,
+        mlp_ratio:           float = 3.0,
+        num_classes:         int   = 100,
+        target_group_size_1: float = 3.0,
+        target_group_size_2: float = 3.0,
+        router_proj_dim:     int   = 64,
+    ):
+        super().__init__()
+        self.target_group_size_1 = target_group_size_1
+        self.target_group_size_2 = target_group_size_2
+        grid_size = image_size // patch_size
+
+        self.patch_embed = PatchEmbed(image_size, patch_size, in_channels, d_model)
+
+        self.encoder1 = nn.ModuleList([
+            TransformerBlock(d_model, num_heads, mlp_ratio)
+            for _ in range(encoder1_blocks)
+        ])
+        self.router1     = BoundaryRouter(d_model, router_proj_dim, grid_size)
+        self.stage1_proj = nn.Linear(d_model, d_model)
+
+        self.encoder2 = nn.ModuleList([
+            TransformerBlock(d_model, num_heads, mlp_ratio)
+            for _ in range(encoder2_blocks)
+        ])
+        self.router2     = MaskedGridRouter(d_model, router_proj_dim, grid_size)
+        self.stage2_proj = nn.Linear(d_model, d_model)
+
+        self.main_net = nn.ModuleList([
+            TransformerBlock(d_model, num_heads, mlp_ratio)
+            for _ in range(main_blocks)
+        ])
+
+        self.norm       = nn.LayerNorm(d_model)
+        self.classifier = nn.Linear(d_model, num_classes) if num_classes > 0 else None
+
+    def forward_features(self, x: torch.Tensor):
+        """
+        Same return contract as ASFNetBR.forward_features (so the AE decoder
+        scatters survivors at exact coords identically), with stage-2 extras:
+
+        Returns:
+            feats:       (B, max_K, D) post-norm final survivor tokens
+            coord_c:     (B, max_K, 2) exact grid coords per survivor
+            pad_mask:    (B, max_K) True = padding
+            sel:         (B, max_K) original grid index per slot
+            keep2:       (B, N) bool FINAL retention mask (subset of keep1)
+            l_ratio1, l_ratio2: scalar router losses
+            mean_kept1:  0-dim GPU tensor — stage-1 survivors
+            mean_kept2:  0-dim GPU tensor — final survivors
+            s1, s2:      (B, N) differentiable boundary evidence per stage
+            probs1:      (B, E) stage-1 soft edge probabilities
+        """
+        tokens, coords = self.patch_embed(x)
+        N = tokens.shape[1]
+
+        # ---- Stage 1 (identical to ASFNetBR / ASFNetBR2) ----
+        for block in self.encoder1:
+            tokens = block(tokens, coords)
+
+        hard1, probs1, l_ratio1 = self.router1(tokens, self.target_group_size_1)
+
+        s1    = token_boundary_evidence(probs1, self.router1.edge_indices, N)
+        keep1 = border_keep_mask(hard1, self.router1.edge_indices, N)
+        keep1 = keep1 | (keep1.sum(dim=1, keepdim=True) == 0)
+
+        tokens = tokens + s1.unsqueeze(-1) * tokens
+        tokens = self.stage1_proj(tokens)
+
+        # ---- Stage 2 encoder: full layout, dropped tokens masked as keys ----
+        drop1 = ~keep1
+        for block in self.encoder2:
+            tokens = block(tokens, coords, drop1)
+
+        # ---- Stage 2 retention on the survivor subgraph ----
+        hard2, probs2, valid2, l_ratio2 = self.router2(
+            tokens, keep1, self.target_group_size_2,
+        )
+
+        keep2 = masked_border_keep(hard2, valid2, self.router2.edge_indices, N, keep1)
+        # Guard: an image with zero stage-2 cuts (and no islands) would keep
+        # nothing — fall back to keep1 for that image (stage 2 uncompressed).
+        keep2 = keep2 | (keep1 & (keep2.sum(dim=1, keepdim=True) == 0))
+
+        # Stage-2 confidence residual on VALID edges only — probs2's
+        # gradient path (there is no weighted merge in this variant).
+        idx_i, idx_j = self.router2.edge_indices[:, 0], self.router2.edge_indices[:, 1]
+        pw = probs2 * valid2.to(probs2.dtype)
+        s2 = pw.new_zeros(pw.shape[0], N)
+        s2 = s2.index_add(1, idx_i, pw).index_add(1, idx_j, pw)
+
+        tokens = tokens + s2.unsqueeze(-1) * tokens
+
+        tok_c, coord_c, pad_mask, sel, n_keep = compact_survivors(tokens, coords, keep2)
+        tok_c = self.stage2_proj(tok_c)
+
+        for block in self.main_net:
+            tok_c = block(tok_c, coord_c, pad_mask)
+
+        tok_c = self.norm(tok_c)
+
+        mean_kept1 = keep1.float().sum(dim=1).mean().detach()
+        mean_kept2 = n_keep.float().mean().detach()
+
+        return (tok_c, coord_c, pad_mask, sel, keep2, l_ratio1, l_ratio2,
+                mean_kept1, mean_kept2, s1, s2, probs1)
+
+    def forward(self, x: torch.Tensor):
+        """Returns: logits, l_ratio1, l_ratio2, mean_kept1, mean_kept2"""
+        feats, _, pad_mask, _, _, l_ratio1, l_ratio2, mean_kept1, \
+            mean_kept2, _s1, _s2, _probs1 = self.forward_features(x)
+
+        real_mask   = (~pad_mask).float()
+        token_sum   = (feats * real_mask.unsqueeze(-1)).sum(dim=1)
+        token_count = real_mask.sum(dim=1, keepdim=True).clamp(min=1)
+        pooled      = token_sum / token_count
+
+        logits = self.classifier(pooled)
+        return logits, l_ratio1, l_ratio2, \
+            float(mean_kept1.item()), float(mean_kept2.item())
+
+    def count_parameters(self) -> dict:
+        def n(m): return sum(p.numel() for p in m.parameters()) if m is not None else 0
+        return {
+            "patch_embed": n(self.patch_embed),
+            "encoder1":    n(self.encoder1),
+            "router1":     n(self.router1),
+            "stage1_proj": n(self.stage1_proj),
+            "encoder2":    n(self.encoder2),
+            "router2":     n(self.router2),
+            "stage2_proj": n(self.stage2_proj),
+            "main_net":    n(self.main_net),
+            "norm+head":   n(self.norm) + n(self.classifier),
+            "total":       n(self),
+        }
+
+
+# ---------------------------------------------------------------------------
 # ASFNetBR2 — two-stage: retention, then grid-adjacent grouping of survivors
 # ---------------------------------------------------------------------------
 

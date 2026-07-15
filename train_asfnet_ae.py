@@ -35,7 +35,7 @@ from tqdm import tqdm
 
 from dataset import get_dataloaders
 from model_asfnet_ae import ASFNetAE
-from model_asfnet_ae2 import ASFNetAE2
+from model_asfnet_ae2 import ASFNetAE2, ASFNetAE2R
 from utils import AverageMeter
 
 
@@ -51,7 +51,8 @@ def build_model(args):
         assert not (args.keep_budget > 0 or args.keep_ratio_target > 0
                     or args.xattn_slots > 0), \
             "two_stage has no keep_budget / keep-rate / xattn_slots variant yet"
-        return ASFNetAE2(
+        cls = ASFNetAE2R if args.stage2 == "retain" else ASFNetAE2
+        return cls(
             image_size          = args.image_size,
             patch_size          = args.patch_size,
             in_channels         = 3,
@@ -224,6 +225,12 @@ def main():
                              "--encoder_blocks is stage 1's depth.")
     parser.add_argument("--encoder2_blocks",     type=int,   default=3)
     parser.add_argument("--target_group_size_2", type=float, default=3.0)
+    parser.add_argument("--stage2", type=str, default="pool",
+                        choices=["pool", "retain"],
+                        help="pool: stage-2 chunks pooled to group tokens "
+                             "(ASFNetAE2, loss on all patches). retain: "
+                             "border-keep at stage 2 too — no pooling "
+                             "anywhere (ASFNetAE2R, loss on dropped only).")
 
     # --- Decoder (MAE-style: narrower + shallower than encoder) ---
     parser.add_argument("--decoder_d_model", type=int, default=128)

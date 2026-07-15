@@ -41,7 +41,7 @@ from model_asfnet_br import (
 )
 from model_asfnet import gpu_connected_components
 from model_asfnet_ae import ASFNetAE
-from model_asfnet_ae2 import ASFNetAE2
+from model_asfnet_ae2 import ASFNetAE2, ASFNetAE2R
 
 # Reuse the existing viz primitives — evaluate_asfnet2 guards its main().
 from evaluate_asfnet2 import (
@@ -61,7 +61,8 @@ def _load_model(path: str, device: torch.device, ae: bool):
     a = ckpt["args"]
 
     if ae and a.get("two_stage", False):
-        model = ASFNetAE2(
+        ae2_cls = ASFNetAE2R if a.get("stage2") == "retain" else ASFNetAE2
+        model = ae2_cls(
             image_size          = a["image_size"],
             patch_size          = a["patch_size"],
             d_model             = a["d_model"],

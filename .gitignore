@@ -7,6 +7,7 @@ viz_*/
 Results/
 wandb/
 runs/
+artifacts/
 
 # Vast.ai automation — never commit these
 vast/secrets.env
