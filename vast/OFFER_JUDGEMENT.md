@@ -23,12 +23,11 @@ below, then `launch.py launch --offer <ID>`.
 5. **Location**: prefer North America over elsewhere; prefer Canada over the
    US. Subordinate to the CPU preference.
 6. **Container/disk size: 80 GB.**
-7. **Image**: use the Vast-built template base, not vanilla DockerHub images
-   (hosts pre-cache Vast's own images → ~1 min boots). Current pick:
-   `vastai/pytorch:2.9.1-cu128-cuda-12.9-mini-py312-2026-06-15` — cu128 is
-   the minimum for Blackwell (sm_120/sm_100). The CUDA 10 template card the
-   user quoted is Vast's ancient base-template description; the intent
-   (Vast template lineage) is honored with the current CUDA 12.8+ build.
+7. **Image (user-specified, verbatim): `vastai/pytorch:cuda-13.2.1-auto`.**
+   The Vast.ai pytorch template from DockerHub — its description text is
+   outdated boilerplate (mentions CUDA 10 / pytorch 1.0), ignore that; the
+   image itself is auto-updated (CUDA 13.2, Blackwell-capable, refreshed
+   ~monthly). Do not substitute other tags without asking the user.
 
 ## Standing criteria (from operational experience)
 

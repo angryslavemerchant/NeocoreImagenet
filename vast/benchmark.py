@@ -229,6 +229,8 @@ def main():
             thresholds = json.load(f)
         failed = []
         for key, minimum in thresholds.items():
+            if key.startswith("_"):   # comment/metadata keys
+                continue
             value = results.get(key)
             if value is None or value < minimum:
                 failed.append(f"{key}: {value} < {minimum}")

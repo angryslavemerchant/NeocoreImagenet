@@ -39,10 +39,10 @@ BLACKLIST = ROOT / ".vast" / "blacklist.json"
 SCAN_OUT  = ROOT / "vast" / "scan_results.json"
 
 REPO_URL  = "https://github.com/angryslavemerchant/NeocoreImagenet.git"
-# Vast's own template image — hosts pre-cache these, so boots take ~1 min
-# instead of a 10-30 min cold DockerHub pull. cu128 build: required for
-# Blackwell (sm_120 / sm_100); torch 2.9.1 = mature release, low API drift.
-IMAGE     = "vastai/pytorch:2.9.1-cu128-cuda-12.9-mini-py312-2026-06-15"
+# USER-SPECIFIED (2026-07-14): the Vast.ai pytorch template, auto-updating
+# CUDA 13.2 build. Its DockerHub description text is outdated boilerplate —
+# the image itself is current (torch + CUDA 13.2, Blackwell-capable).
+IMAGE     = "vastai/pytorch:cuda-13.2.1-auto"
 DISK_GB   = 80
 
 VASTAI = (shutil.which("vastai")
