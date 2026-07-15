@@ -54,6 +54,10 @@ below, then `launch.py launch --offer <ID>`.
 - machine 34887 — Ryzen 9 9950X 4090, looks great on paper, boots fast, but
   silently DROPS contracts: accepted twice, instance vanished within ~90s
   both times (no status, no logs, no billing), 2026-07-14
+- machine 36615 — Alberta, Core Ultra 7 265K + RTX PRO 6000 WS. Benchmarked
+  superbly once (384 TFLOPS bf16), but then dropped a running contract ~8
+  min into provisioning (instance vanished from the API mid-benchmark),
+  2026-07-15. One strike — retry-worthy later, but not twice in a row.
 
 ## Post-boot judgment
 

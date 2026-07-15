@@ -31,17 +31,25 @@ import urllib.request
 _UA = {"User-Agent": "Mozilla/5.0 (vast-bench)"}
 
 
-def _timed_read(url: str, size_mb: int, headers: dict = None) -> tuple[int, float]:
-    """Read up to size_mb from url, return (bytes, seconds)."""
+def _timed_read(url: str, size_mb: int, headers: dict = None,
+                deadline_s: float = 40.0) -> tuple[int, float]:
+    """Read up to size_mb from url, return (bytes, seconds).
+
+    deadline_s is a wall-clock cap on the read loop: the urlopen timeout only
+    bounds each individual recv(), so a connection that trickles bytes can
+    otherwise block forever at zero CPU.
+    """
     req = urllib.request.Request(url, headers={**_UA, **(headers or {})})
     t0 = time.perf_counter()
     n = 0
-    with urllib.request.urlopen(req, timeout=120) as r:
+    with urllib.request.urlopen(req, timeout=20) as r:
         while n < size_mb * (1 << 20):
-            chunk = r.read(1 << 20)
+            chunk = r.read(256 << 10)
             if not chunk:
                 break
             n += len(chunk)
+            if time.perf_counter() - t0 > deadline_s:
+                break
     return n, time.perf_counter() - t0
 
 
@@ -81,7 +89,7 @@ def bench_download(size_mb: int = 200) -> dict:
         try:
             n, dt = _timed_read(url, size_mb, headers)
             if n < 10 * (1 << 20):
-                raise RuntimeError(f"only {n} bytes from {src}")
+                raise RuntimeError(f"only {n} bytes in {dt:.0f}s from {src}")
             return {"download_mbps": round(n * 8 / 1e6 / dt, 1),
                     "download_src": src}
         except Exception as e:
@@ -196,13 +204,46 @@ def bench_gpu(n: int = 8192, reps: int = 30) -> dict:
 
 # ---------------------------------------------------------------------------
 
+# name -> (fn, hard timeout in seconds). GPU tests include torch import +
+# CUDA context creation, which alone can take ~30s on a cold instance.
 TESTS = {
-    "download": bench_download,
-    "disk": bench_disk,
-    "cpu": bench_cpu,
-    "pcie": bench_pcie,
-    "gpu": bench_gpu,
+    "download": (bench_download, 240),
+    "disk": (bench_disk, 180),
+    "cpu": (bench_cpu, 120),
+    "pcie": (bench_pcie, 180),
+    "gpu": (bench_gpu, 240),
 }
+
+
+def _test_child(name: str, q) -> None:
+    try:
+        q.put(("ok", TESTS[name][0]()))
+    except Exception as e:
+        q.put(("err", f"{type(e).__name__}: {e}"))
+
+
+def run_test(name: str) -> dict:
+    """Run one test in a subprocess with a hard timeout, so a wedged test
+    (stalled network read, hung CUDA init) can never freeze the whole gate."""
+    fn, timeout_s = TESTS[name]
+    ctx = mp.get_context("spawn")
+    q = ctx.Queue()
+    p = ctx.Process(target=_test_child, args=(name, q))
+    p.start()
+    p.join(timeout_s)
+    if p.is_alive():
+        p.terminate()
+        p.join(10)
+        if p.is_alive():
+            p.kill()
+            p.join()
+        raise TimeoutError(f"exceeded {timeout_s}s hard limit")
+    if q.empty():
+        raise RuntimeError(f"test process died (exit code {p.exitcode})")
+    status, payload = q.get()
+    if status != "ok":
+        raise RuntimeError(payload)
+    return payload
 
 
 def main():
@@ -217,12 +258,14 @@ def main():
     skip = set(filter(None, args.skip.split(",")))
     results: dict = {"timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
 
-    for name, fn in TESTS.items():
+    for name in TESTS:
         if name in skip:
             continue
         try:
+            print(f"[bench] {name}: running (limit {TESTS[name][1]}s)",
+                  file=sys.stderr, flush=True)
             t0 = time.perf_counter()
-            results.update(fn())
+            results.update(run_test(name))
             print(f"[bench] {name}: ok ({time.perf_counter() - t0:.1f}s)",
                   file=sys.stderr)
         except Exception as e:  # a failed test is a data point, not a crash

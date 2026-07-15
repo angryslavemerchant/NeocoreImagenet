@@ -48,7 +48,7 @@ command -v tmux >/dev/null 2>&1 || { apt-get update -qq && apt-get install -y -q
 # --- Benchmark-only mode: measure, report, self-destroy -------------------
 if [ -n "${BENCH_ONLY:-}" ]; then
     "$PY" -m pip install -q numpy Pillow
-    "$PY" vast/benchmark.py --out /workspace/benchmark.json
+    timeout -k 60 1200 "$PY" vast/benchmark.py --out /workspace/benchmark.json
     echo "BENCH_ONLY_DONE"
     self_destroy
     exit 0
@@ -61,7 +61,8 @@ echo "INSTALLING_DEPS"
 # --- Health gate: refuse to train on a sick machine -------------------------
 # KEEP_ALIVE (smoke tests) preserves the instance so the failing metrics
 # can be inspected — otherwise the destroy takes the evidence with it.
-if ! "$PY" vast/benchmark.py --gate vast/thresholds.json --out /workspace/benchmark.json; then
+# timeout = outer belt; benchmark.py also enforces per-test hard limits.
+if ! timeout -k 60 1200 "$PY" vast/benchmark.py --gate vast/thresholds.json --out /workspace/benchmark.json; then
     if [ -n "${KEEP_ALIVE:-}" ]; then
         echo "GATE_FAILED — KEEP_ALIVE set, instance left up for inspection"
         exit 1
