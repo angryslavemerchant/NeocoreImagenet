@@ -49,5 +49,7 @@ fi
 echo "GATE_PASSED"
 
 # --- Launch training detached so it survives everything ---------------------
-tmux new-session -d -s train "bash vast/run_training.sh 2>&1 | tee /workspace/train.log"
+# tee to the container's PID-1 stdout so `vastai logs` sees training output
+# (tmux output is otherwise invisible to docker logs).
+tmux new-session -d -s train "bash vast/run_training.sh 2>&1 | tee /workspace/train.log >> /proc/1/fd/1"
 echo "TRAIN_LAUNCHED tmux=train log=/workspace/train.log"
