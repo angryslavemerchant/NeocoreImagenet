@@ -1,4 +1,5 @@
 import json
+import time
 from pathlib import Path
 
 import torch
@@ -65,7 +66,19 @@ def _ensure_cache(cfg: Config) -> tuple[int, int]:
 
     if not (train_done and val_done):
         print(f"JPEG cache not found at {root}. Building (one-time cost) ...")
-        raw = load_dataset(cfg.dataset_name, cache_dir=cfg.dataset_cache_dir)
+        # HF Hub throws transient 5xx (502 killed a cloud run at boot,
+        # 2026-07-15) — retry with backoff before giving up.
+        for attempt in range(6):
+            try:
+                raw = load_dataset(cfg.dataset_name, cache_dir=cfg.dataset_cache_dir)
+                break
+            except Exception as e:
+                if attempt == 5:
+                    raise
+                wait = 60 * (attempt + 1)
+                print(f"load_dataset failed ({e!r}) — "
+                      f"retry {attempt + 1}/5 in {wait}s")
+                time.sleep(wait)
         if not train_done:
             _build_split_cache(raw["train"], train_dir)
         if not val_done:
