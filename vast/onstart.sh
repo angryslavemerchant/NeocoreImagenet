@@ -59,7 +59,13 @@ echo "INSTALLING_DEPS"
 "$PY" -m pip install -q -r requirements.txt
 
 # --- Health gate: refuse to train on a sick machine -------------------------
+# KEEP_ALIVE (smoke tests) preserves the instance so the failing metrics
+# can be inspected — otherwise the destroy takes the evidence with it.
 if ! "$PY" vast/benchmark.py --gate vast/thresholds.json --out /workspace/benchmark.json; then
+    if [ -n "${KEEP_ALIVE:-}" ]; then
+        echo "GATE_FAILED — KEEP_ALIVE set, instance left up for inspection"
+        exit 1
+    fi
     echo "GATE_FAILED — instance below thresholds, destroying"
     self_destroy
     exit 1
