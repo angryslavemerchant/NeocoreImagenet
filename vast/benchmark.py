@@ -28,19 +28,54 @@ import urllib.request
 # Individual tests — each returns a dict of metrics, exceptions -> error field
 # ---------------------------------------------------------------------------
 
-def bench_download(size_mb: int = 200) -> dict:
-    """Pull from Cloudflare's speed-test endpoint; report megabits/sec."""
-    url = f"https://speed.cloudflare.com/__down?bytes={size_mb * 1024 * 1024}"
+_UA = {"User-Agent": "Mozilla/5.0 (vast-bench)"}
+
+
+def _timed_read(url: str, size_mb: int) -> tuple[int, float]:
+    """Read up to size_mb from url, return (bytes, seconds)."""
+    req = urllib.request.Request(url, headers=_UA)
     t0 = time.perf_counter()
     n = 0
-    with urllib.request.urlopen(url, timeout=120) as r:
-        while True:
+    with urllib.request.urlopen(req, timeout=120) as r:
+        while n < size_mb * (1 << 20):
             chunk = r.read(1 << 20)
             if not chunk:
                 break
             n += len(chunk)
-    dt = time.perf_counter() - t0
-    return {"download_mbps": round(n * 8 / 1e6 / dt, 1)}
+    return n, time.perf_counter() - t0
+
+
+def bench_download(size_mb: int = 200) -> dict:
+    """
+    Megabits/sec pulling from the HuggingFace CDN — a real shard of the
+    training dataset, i.e. exactly the path the dataset download takes.
+    Falls back to Cloudflare's speed-test endpoint.
+    """
+    urls = []
+    try:
+        api = ("https://huggingface.co/api/datasets/clane9/imagenet-100/"
+               "parquet/default/train")
+        with urllib.request.urlopen(
+                urllib.request.Request(api, headers=_UA), timeout=30) as r:
+            shard_urls = json.load(r)
+        if shard_urls:
+            urls.append(("hf", shard_urls[0]))
+    except Exception:
+        pass
+    urls.append(("cloudflare",
+                 f"https://speed.cloudflare.com/__down?bytes={size_mb * (1 << 20)}"))
+
+    last_err: Exception = RuntimeError("no download source available")
+    for src, url in urls:
+        try:
+            n, dt = _timed_read(url, size_mb)
+            if n < 10 * (1 << 20):
+                raise RuntimeError(f"only {n} bytes from {src}")
+            return {"download_mbps": round(n * 8 / 1e6 / dt, 1),
+                    "download_src": src}
+        except Exception as e:
+            last_err = e
+    raise last_err
 
 
 def bench_disk(path: str = "/workspace/.bench_tmp", size_mb: int = 1024) -> dict:

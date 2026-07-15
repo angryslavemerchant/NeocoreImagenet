@@ -21,7 +21,7 @@ echo "ONSTART_BEGIN instance=${INSTANCE_ID} $(date -u +%FT%TZ)"
 self_destroy() {
     echo "SELF_DESTROY instance=${INSTANCE_ID}"
     sleep 20   # let the log collector catch the final lines
-    vastai destroy instance "${INSTANCE_ID}" --api-key "${VAST_API_KEY}"
+    vastai destroy instance "${INSTANCE_ID}" --api-key "${VAST_API_KEY}" -y
 }
 
 pip install -q vastai

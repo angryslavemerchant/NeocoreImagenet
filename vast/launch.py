@@ -292,7 +292,7 @@ def cmd_scan(args):
     # Clean up: instances self-destroy, but never trust that alone.
     for iid in pending:
         try:
-            vast("destroy", "instance", iid, check=False)
+            vast("destroy", "instance", iid, "-y", check=False)
         except Exception:
             pass
     remaining = [r for r in load_state() if r["id"] not in pending]
@@ -366,7 +366,7 @@ def cmd_destroy(args):
     else:
         ids = [resolve_id(args)]
     for iid in ids:
-        result = vast("destroy", "instance", iid, check=False)
+        result = vast("destroy", "instance", iid, "-y", check=False)
         print(f"destroy {iid}: {result}")
     save_state([r for r in load_state() if r["id"] not in set(ids)])
 
@@ -374,6 +374,9 @@ def cmd_destroy(args):
 # ---------------------------------------------------------------------------
 
 def main():
+    # Windows consoles default to cp1252; instance logs contain UTF-8.
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)

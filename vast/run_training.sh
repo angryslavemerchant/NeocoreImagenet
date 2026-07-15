@@ -44,7 +44,7 @@ echo "RUN_COMPLETE"
 if [ -z "${KEEP_ALIVE:-}" ]; then
     echo "SELF_DESTROY instance=${INSTANCE_ID}"
     sleep 30
-    vastai destroy instance "${INSTANCE_ID}" --api-key "${VAST_API_KEY}"
+    vastai destroy instance "${INSTANCE_ID}" --api-key "${VAST_API_KEY}" -y
 else
     echo "KEEP_ALIVE set — instance left running"
 fi
