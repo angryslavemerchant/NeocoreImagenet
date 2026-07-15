@@ -267,16 +267,16 @@ def main():
 
     if args.resume_artifact:
         art = wandb.use_artifact(args.resume_artifact)
-        for attempt in range(6):   # same 403 blips as the probe download
+        for attempt in range(24):   # same patient retry as the probe download
             try:
                 args.resume = os.path.join(art.download(), "latest.pt")
                 break
             except Exception as e:
-                if attempt == 5:
+                if attempt == 23:
                     raise
-                wait = 60 * (attempt + 1)
+                wait = min(300, 60 * (attempt + 1))
                 print(f"resume artifact download failed ({e!r}) — "
-                      f"retry {attempt + 1}/5 in {wait}s")
+                      f"retry {attempt + 1}/23 in {wait}s")
                 time.sleep(wait)
 
     train_loader, val_loader = get_dataloaders(args)
