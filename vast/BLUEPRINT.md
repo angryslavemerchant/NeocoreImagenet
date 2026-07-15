@@ -132,6 +132,10 @@ Porting = copy the folder, edit the table's right column, push, smoke test.
     `export VAR='...'` instead.
 12. **`wandb artifact` names**: use `<project>-<run_id>` so multiple runs
     never collide; alias `final` for the end-of-run version.
+13. **tmux output is invisible to `vastai logs`** (docker captures only
+    PID 1's stdout). Pipe the tmux payload through
+    `tee /workspace/train.log >> /proc/1/fd/1` so remote log polling can see
+    training markers too.
 
 ## Operating cost intuition (2026 figures)
 
