@@ -77,6 +77,51 @@ def keep_overlay(img_np: np.ndarray, keep_row: torch.Tensor,
     return out
 
 
+def components_np(keep_row: np.ndarray, hard_row: np.ndarray,
+                  valid_row: np.ndarray, edges: np.ndarray, n: int) -> np.ndarray:
+    """Connected components of the survivor subgraph (uncut valid edges);
+    dropped tokens = -1. Plain BFS on CPU."""
+    adj = [[] for _ in range(n)]
+    for (i, j), h, v in zip(edges, hard_row, valid_row):
+        if v and h < 0.5:
+            adj[i].append(j)
+            adj[j].append(i)
+    labels = np.full(n, -1, dtype=np.int64)
+    nxt = 0
+    for start in range(n):
+        if not keep_row[start] or labels[start] >= 0:
+            continue
+        stack = [start]
+        labels[start] = nxt
+        while stack:
+            u = stack.pop()
+            for v in adj[u]:
+                if keep_row[v] and labels[v] < 0:
+                    labels[v] = nxt
+                    stack.append(v)
+        nxt += 1
+    return labels
+
+
+def chunk_map(img_np: np.ndarray, labels: np.ndarray, grid: int, patch: int,
+              seed: int = 0) -> np.ndarray:
+    """Random-color chunk overlay blended onto the (dimmed) image; dropped
+    tokens stay dark."""
+    rng = np.random.RandomState(seed)
+    n_lab = labels.max() + 1
+    palette = rng.rand(max(n_lab, 1), 3) * 0.9 + 0.1
+    out = img_np * 0.35
+    lab2d = labels.reshape(grid, grid)
+    for r in range(grid):
+        for c in range(grid):
+            if lab2d[r, c] >= 0:
+                col = palette[lab2d[r, c]]
+                blk = out[r * patch:(r + 1) * patch, c * patch:(c + 1) * patch]
+                out[r * patch:(r + 1) * patch, c * patch:(c + 1) * patch] = \
+                    0.45 * blk + 0.55 * col
+    return np.clip(out, 0, 1)
+
+
 def subgraph_stats(model, keep_prev: torch.Tensor, hard: torch.Tensor,
                    valid: torch.Tensor) -> str:
     n_tok   = keep_prev.sum(dim=1).float()
@@ -114,6 +159,7 @@ def main():
         target_group_size = a["target_group_size"],
         router_proj_dim   = a["router_proj_dim"],
         norm_pix_loss     = not a.get("no_norm_pix", False),
+        router_kind       = a.get("router_kind", "edge"),
     )
     sd = {k.replace("_orig_mod.", "", 1): v for k, v in ckpt["model"].items()}
     model.load_state_dict(sd, strict=True)
@@ -127,8 +173,10 @@ def main():
         model.forward_features(imgs)
     recon, _ = model.reconstruct(imgs)
 
-    # per-stage subgraph stats (rerun routers on the recorded keeps)
+    # per-stage subgraph stats (rerun routers on the recorded keeps),
+    # collecting (keep_prev, hard, valid) for the chunk maps
     print("\nper-stage survivor-subgraph statistics:")
+    stage_cutdata = []
     keep_prev = torch.ones_like(stage_keeps[0])
     tokens, coords = model.patch_embed(imgs)
     tok_c, coord_c, pm, sl = tokens, coords, None, None
@@ -147,6 +195,7 @@ def main():
                                              model.target_group_size)
         print(f"  stage {i + 1}: {subgraph_stats(model, keep_prev, hard, valid)}"
               f"  -> kept {stage_keeps[i].sum(dim=1).float().mean():.1f}")
+        stage_cutdata.append((keep_prev.clone(), hard.clone(), valid.clone()))
         # replay the residual+compact so stage i+1 sees the right features
         ei = stage.router.edge_indices
         pw = probs * valid.to(probs.dtype)
@@ -164,23 +213,28 @@ def main():
         tok_c, coord_c, pm, sl, _ = compact_survivors(full_post, coords,
                                                       keep_prev)
 
-    # ---- panel: original | stage keeps | reconstruction ----
+    # ---- panel: original | per stage (chunk map, keep) | reconstruction ----
     g, p = model.grid_size, model.patch_size
     n = len(imgs)
-    cols = 2 + len(stage_keeps)
+    edges_np = model.stages[0].router.edge_indices.numpy()
+    cols = 2 + 2 * len(stage_keeps)
     fig, axes = plt.subplots(n, cols, figsize=(2.2 * cols, 2.2 * n))
     for i in range(n):
         img_np = denorm(imgs[i])
         axes[i, 0].imshow(img_np)
         axes[i, 0].set_title("original" if i == 0 else "", fontsize=8)
-        for j, sk in enumerate(stage_keeps):
-            axes[i, 1 + j].imshow(keep_overlay(img_np, sk[i], g, p))
-            if i == 0:
-                axes[i, 1 + j].set_title(
-                    f"stage {j + 1} keep ({int(sk[i].sum())})", fontsize=8)
-            else:
-                axes[i, 1 + j].set_title(
-                    f"({int(sk[i].sum())})", fontsize=7)
+        for j in range(len(stage_keeps)):
+            kp, hard, valid = stage_cutdata[j]
+            labels = components_np(kp[i].numpy(), hard[i].numpy(),
+                                   valid[i].numpy(), edges_np, model.n_patches)
+            n_chunks = labels.max() + 1
+            axes[i, 1 + 2 * j].imshow(chunk_map(img_np, labels, g, p))
+            axes[i, 1 + 2 * j].set_title(
+                f"stage {j + 1} chunks ({n_chunks})", fontsize=8 if i == 0 else 7)
+            sk = stage_keeps[j]
+            axes[i, 2 + 2 * j].imshow(keep_overlay(img_np, sk[i], g, p))
+            axes[i, 2 + 2 * j].set_title(
+                f"keep ({int(sk[i].sum())})", fontsize=8 if i == 0 else 7)
         rec_np = recon[i].numpy().transpose(1, 2, 0)
         rec_np = (rec_np - rec_np.min()) / (rec_np.max() - rec_np.min() + 1e-8)
         axes[i, -1].imshow(rec_np)

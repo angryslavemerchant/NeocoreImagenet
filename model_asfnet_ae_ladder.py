@@ -47,6 +47,132 @@ from model_asfnet_br import (
 )
 
 
+class FieldRouter(nn.Module):
+    """
+    Potential-field router: emits a SCALAR FIELD u per token; a (valid) edge
+    is cut iff the endpoints' quantized field values differ
+    (round(u_i) != round(u_j)).
+
+    WHY (2026-07-16 pause): with per-edge cut probabilities, cuts need not
+    close — a mesh of slits makes every token "border" without enclosing
+    anything, and every threshold invites parking. Level-set boundaries are
+    closed curves BY TOPOLOGY: two tokens in different bins cannot be
+    connected by any same-bin path, so EVERY cut separates two chunks and
+    interiors exist by construction. This restores in 2D the 1D identity
+    H-Net relies on (every cut is a real chunk boundary).
+
+    Soft evidence for the gradient path: p_e = sigmoid(4*(|du| - 0.5)) —
+    high when the field jumps by more than half a bin across the edge. The
+    hard cut is a detached routing fact, as everywhere else in ASFNet; u
+    learns through the confidence residual on accumulated evidence. There
+    is no ratio loss and no free per-edge threshold: with hard budgets
+    downstream, collapsing u to a constant gives an ARBITRARY top-k and a
+    high reconstruction loss, so — unlike threshold parking — collapse is
+    not a low-loss corner.
+    """
+
+    def __init__(self, d_model: int, proj_dim: int, grid_size: int):
+        super().__init__()
+        self.head = nn.Sequential(
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, proj_dim),
+            nn.GELU(),
+            nn.Linear(proj_dim, 1),
+        )
+        # same fixed grid-edge buffer layout as BoundaryRouter
+        idx = torch.arange(grid_size * grid_size).reshape(grid_size, grid_size)
+        right = torch.stack([idx[:, :-1].flatten(), idx[:, 1:].flatten()], dim=1)
+        down  = torch.stack([idx[:-1, :].flatten(), idx[1:, :].flatten()], dim=1)
+        self.register_buffer("edge_indices", torch.cat([right, down], dim=0))
+
+    def forward(
+        self,
+        h:                 torch.Tensor,   # (B, N, D) full-grid layout
+        keep:              torch.Tensor,   # (B, N) bool current survivors
+        target_group_size: float,          # unused; signature parity
+    ):
+        u = self.head(h).squeeze(-1)                    # (B, N)
+        idx_i = self.edge_indices[:, 0]
+        idx_j = self.edge_indices[:, 1]
+
+        du    = u[:, idx_i] - u[:, idx_j]               # (B, E)
+        probs = torch.sigmoid(4.0 * (du.abs() - 0.5))
+        hard  = (torch.round(u[:, idx_i].detach())
+                 != torch.round(u[:, idx_j].detach())).float()
+
+        valid   = keep[:, idx_i] & keep[:, idx_j]
+        l_ratio = h.new_zeros(())                        # no auxiliary loss
+        return hard, probs, valid, l_ratio
+
+
+@torch.compiler.disable
+def grid_component_labels(
+    connected:    torch.Tensor,   # (B, E) bool — valid AND uncut
+    edge_indices: torch.Tensor,   # (E, 2)
+    n_tokens:     int,
+    keep:         torch.Tensor,   # (B, N) bool
+    iters:        int = 64,
+) -> torch.Tensor:
+    """
+    Fixed-iteration min-label propagation over the survivor subgraph
+    (compile-disabled: a data-dependent loop with no sync'd early exit).
+    `iters` bounds the merge diameter — regions with graph diameter beyond
+    it may keep >1 label, which only creates phantom borders (extra keep
+    candidates), never lost ones. Dropped tokens get label -1.
+    Returns (B, N) long.
+    """
+    B = connected.shape[0]
+    device = connected.device
+    idx_i, idx_j = edge_indices[:, 0], edge_indices[:, 1]
+
+    labels = torch.arange(n_tokens, device=device).unsqueeze(0).expand(B, -1).clone()
+    labels = labels.masked_fill(~keep, -1)
+
+    INF = n_tokens
+    idx_i_exp = idx_i.unsqueeze(0).expand(B, -1)
+    idx_j_exp = idx_j.unsqueeze(0).expand(B, -1)
+    for _ in range(iters):
+        li, lj = labels[:, idx_i], labels[:, idx_j]
+        mn = torch.minimum(li, lj)
+        prop = torch.where(connected, mn, mn.new_full((), INF))
+        new = labels.clone()
+        new.scatter_reduce_(1, idx_j_exp, prop, reduce="amin", include_self=True)
+        new.scatter_reduce_(1, idx_i_exp, prop, reduce="amin", include_self=True)
+        labels = new.masked_fill(~keep, -1)
+    return labels
+
+
+def component_border_keep(
+    hard:         torch.Tensor,   # (B, E)
+    valid:        torch.Tensor,   # (B, E) bool
+    edge_indices: torch.Tensor,
+    n_tokens:     int,
+    keep_prev:    torch.Tensor,   # (B, N) bool
+) -> torch.Tensor:
+    """
+    Enclosure-aware border retention: a cut edge counts only if it actually
+    SEPARATES two connected components of the survivor subgraph — slits
+    (cuts whose endpoints remain connected around them) confer no
+    border-ness. Islands (no valid edges) are singleton chunks: all-border,
+    kept, as everywhere else in ASFNet.
+    """
+    idx_i, idx_j = edge_indices[:, 0], edge_indices[:, 1]
+    connected = valid & (hard.detach() < 0.5)
+    labels = grid_component_labels(connected, edge_indices, n_tokens, keep_prev)
+
+    separating = (valid & (hard.detach() > 0.5)
+                  & (labels[:, idx_i] != labels[:, idx_j])).float()
+    b = separating.new_zeros(separating.shape[0], n_tokens)
+    b = b.index_add(1, idx_i, separating).index_add(1, idx_j, separating)
+
+    vf = valid.float()
+    per_tok = vf.new_zeros(vf.shape[0], n_tokens)
+    per_tok = per_tok.index_add(1, idx_i, vf).index_add(1, idx_j, vf)
+    island = per_tok < 0.5
+
+    return keep_prev & ((b > 0.5) | island)
+
+
 class LadderStage(nn.Module):
     """proj (widen) -> blocks on compacted survivors -> router. The keep /
     budget arithmetic lives in ASFNetAELadder.forward_features, which owns
@@ -54,17 +180,22 @@ class LadderStage(nn.Module):
 
     def __init__(self, d_in: int, d_model: int, num_heads: int, blocks: int,
                  budget_tokens: int, grid_size: int, router_proj_dim: int,
-                 mlp_ratio: float):
+                 mlp_ratio: float, router_kind: str = "edge"):
         super().__init__()
         assert (d_model // num_heads) % 4 == 0, \
             "head_dim must be divisible by 4 for 2D RoPE"
+        assert router_kind in ("edge", "field", "component")
         self.budget_tokens = budget_tokens
+        self.router_kind = router_kind
         self.proj = nn.Linear(d_in, d_model)
         self.blocks = nn.ModuleList([
             TransformerBlock(d_model, num_heads, mlp_ratio)
             for _ in range(blocks)
         ])
-        self.router = MaskedGridRouter(d_model, router_proj_dim, grid_size)
+        if router_kind == "field":
+            self.router = FieldRouter(d_model, router_proj_dim, grid_size)
+        else:
+            self.router = MaskedGridRouter(d_model, router_proj_dim, grid_size)
 
 
 class ASFNetAELadder(nn.Module):
@@ -85,10 +216,12 @@ class ASFNetAELadder(nn.Module):
         decoder_blocks:    int   = 3,
         decoder_heads:     int   = 4,
         norm_pix_loss:     bool  = True,
+        router_kind:       str   = "edge",
     ):
         super().__init__()
         assert len(stage_dims) == len(stage_heads) == len(stage_blocks) \
             == len(stage_budgets)
+        self.router_kind = router_kind
         assert all(a > b for a, b in zip(stage_budgets, stage_budgets[1:])), \
             "budgets must strictly decrease"
         assert (decoder_d_model // decoder_heads) % 4 == 0
@@ -107,7 +240,7 @@ class ASFNetAELadder(nn.Module):
         dims_in = (stage_dims[0],) + tuple(stage_dims[:-1])
         self.stages = nn.ModuleList([
             LadderStage(d_in, d, h, b, k, self.grid_size,
-                        router_proj_dim, mlp_ratio)
+                        router_proj_dim, mlp_ratio, router_kind=router_kind)
             for d_in, d, h, b, k in zip(dims_in, stage_dims, stage_heads,
                                         stage_blocks, stage_budgets)
         ])
@@ -200,7 +333,14 @@ class ASFNetAELadder(nn.Module):
             tok_c  = tok_c + s_slot.unsqueeze(-1) * tok_c
 
             # Border retention on the survivor subgraph, then the budget.
-            new_keep = masked_border_keep(hard, valid, ei, N, keep)
+            # edge/field: any incident (valid) cut confers border-ness —
+            #   for the field router every cut separates BY CONSTRUCTION.
+            # component: only cuts that separate true connected components
+            #   count (slits confer nothing).
+            if self.router_kind == "component":
+                new_keep = component_border_keep(hard, valid, ei, N, keep)
+            else:
+                new_keep = masked_border_keep(hard, valid, ei, N, keep)
             new_keep = new_keep | (keep & (new_keep.sum(dim=1, keepdim=True) == 0))
 
             K = stage.budget_tokens

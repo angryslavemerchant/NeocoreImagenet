@@ -61,6 +61,7 @@ def build_model(args):
             target_group_size = args.target_group_size,
             router_proj_dim   = args.router_proj_dim,
             norm_pix_loss     = not args.no_norm_pix,
+            router_kind       = args.router_kind,
         )
     if args.two_stage:
         assert args.keep_ratio_target == 0, \
@@ -244,6 +245,14 @@ def main():
                              "--encoder_blocks is stage 1's depth.")
     parser.add_argument("--encoder2_blocks",     type=int,   default=3)
     parser.add_argument("--target_group_size_2", type=float, default=3.0)
+    parser.add_argument("--router_kind", type=str, default="edge",
+                        choices=["edge", "field", "component"],
+                        help="ladder only. edge: per-edge cut probs (original). "
+                             "field: quantized scalar potential — every cut is "
+                             "a closed chunk boundary by construction, no ratio "
+                             "loss. component: edge cuts but border-ness only "
+                             "from cuts that separate true connected components "
+                             "(slits count for nothing).")
     parser.add_argument("--ladder", action="store_true",
                         help="N-stage fine-patch ladder AE (ASFNetAELadder): "
                              "4x4 patches, budgets 784/196/49, dims 64/128/256. "
