@@ -171,6 +171,7 @@ def load_backbone(args, device) -> tuple[ASFNetBR, dict]:
             router_proj_dim   = a["router_proj_dim"],
             norm_pix_loss     = not a.get("no_norm_pix", False),
             router_kind       = a.get("router_kind", "edge"),
+            budget_floor      = a.get("budget_floor", False),
         )
         sd = {k.replace("_orig_mod.", "", 1): v for k, v in ckpt["model"].items()}
         model.load_state_dict(sd, strict=True)

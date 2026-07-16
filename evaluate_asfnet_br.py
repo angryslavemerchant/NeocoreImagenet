@@ -70,6 +70,7 @@ def _load_model(path: str, device: torch.device, ae: bool):
             router_proj_dim   = a["router_proj_dim"],
             norm_pix_loss     = not a.get("no_norm_pix", False),
             router_kind       = a.get("router_kind", "edge"),
+            budget_floor      = a.get("budget_floor", False),
         )
     elif ae and a.get("two_stage", False):
         kw = dict(

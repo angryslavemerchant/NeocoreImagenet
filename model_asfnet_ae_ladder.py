@@ -217,11 +217,19 @@ class ASFNetAELadder(nn.Module):
         decoder_heads:     int   = 4,
         norm_pix_loss:     bool  = True,
         router_kind:       str   = "edge",
+        budget_floor:      bool  = False,
     ):
         super().__init__()
         assert len(stage_dims) == len(stage_heads) == len(stage_blocks) \
             == len(stage_budgets)
         self.router_kind = router_kind
+        # budget_floor: keep EXACTLY K per stage — border tokens first, then
+        # highest-evidence survivors fill any deficit. Added 2026-07-16 after
+        # two under-supply collapses: budgets-as-caps let routers go zero-cut
+        # and ride the island guard down to a handful of tokens, at which
+        # point later routers receive zero gradient (no valid edges) and
+        # freeze. A floor makes the rate a true architectural constant.
+        self.budget_floor = budget_floor
         assert all(a > b for a, b in zip(stage_budgets, stage_budgets[1:])), \
             "budgets must strictly decrease"
         assert (decoder_d_model // decoder_heads) % 4 == 0
@@ -344,12 +352,23 @@ class ASFNetAELadder(nn.Module):
             new_keep = new_keep | (keep & (new_keep.sum(dim=1, keepdim=True) == 0))
 
             K = stage.budget_tokens
-            scores = s_total.detach().masked_fill(~new_keep, float("-inf"))
-            top    = scores.topk(K, dim=1).indices
-            capped = torch.zeros_like(new_keep)
-            capped = capped.scatter(1, top, True) & new_keep
-            over   = new_keep.sum(dim=1, keepdim=True) > K
-            keep   = torch.where(over, capped, new_keep)
+            if self.budget_floor:
+                # Exact-K: borders outrank everything (BIG bonus), evidence
+                # breaks ties and fills the deficit from the remaining
+                # survivors. keep_prev >= K holds by the ladder's strictly
+                # decreasing budgets, so exactly K survive every stage.
+                scores = (s_total.detach()
+                          + 1e6 * new_keep.float()).masked_fill(
+                              ~keep, float("-inf"))
+                top  = scores.topk(K, dim=1).indices
+                keep = torch.zeros_like(keep).scatter(1, top, True)
+            else:
+                scores = s_total.detach().masked_fill(~new_keep, float("-inf"))
+                top    = scores.topk(K, dim=1).indices
+                capped = torch.zeros_like(new_keep)
+                capped = capped.scatter(1, top, True) & new_keep
+                over   = new_keep.sum(dim=1, keepdim=True) > K
+                keep   = torch.where(over, capped, new_keep)
 
             # Compact the (post-residual) survivors for the next stage —
             # sequence length from here on is bounded by K: memory is

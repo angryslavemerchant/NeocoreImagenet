@@ -62,6 +62,7 @@ def build_model(args):
             router_proj_dim   = args.router_proj_dim,
             norm_pix_loss     = not args.no_norm_pix,
             router_kind       = args.router_kind,
+            budget_floor      = args.budget_floor,
         )
     if args.two_stage:
         assert args.keep_ratio_target == 0, \
@@ -253,6 +254,11 @@ def main():
                              "loss. component: edge cuts but border-ness only "
                              "from cuts that separate true connected components "
                              "(slits count for nothing).")
+    parser.add_argument("--budget_floor", action="store_true",
+                        help="ladder only: keep EXACTLY the budget per stage "
+                             "(borders first, evidence fills the deficit) — "
+                             "prevents under-supply collapse / gradient "
+                             "starvation of later routers.")
     parser.add_argument("--ladder", action="store_true",
                         help="N-stage fine-patch ladder AE (ASFNetAELadder): "
                              "4x4 patches, budgets 784/196/49, dims 64/128/256. "
