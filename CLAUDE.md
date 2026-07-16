@@ -95,11 +95,41 @@ rec numbers are NOT comparable across conventions.
    comparable to 16x16 runs — different patch size and mask rate). Rec was
    still falling at epoch 300 (undertrained). Weights/panels:
    runs/AEL_4px_3stage/.
-5. Candidate next: probe the ladder backbone (train_linear_probe.py only
-   loads ASFNetBR — needs a ladder variant); longer ladder training;
-   warm-start experiments; dense 49-slot no-routing control; distillation/
-   JEPA target instead of pixels (probe evidence says pixel targets
-   underorganize semantics).
+5. **Ladder probe**: attentive pool over the final ~24 survivors = 26.3%
+   top-1 — matches budget25's top-49 probe (26.5%) from HALF the tokens
+   (budget25 all-190-survivors remains the absolute best at 32.0%).
+6. **The enclosure diagnosis (the session's core insight).** Per-edge cuts
+   need not CLOSE: a mesh of slits makes every token "border" without
+   enclosing anything, so the architecture never actually asked for
+   chunks. In 1D (H-Net) every cut IS a boundary; the 2D lift broke that
+   identity, and all routing degeneracies trace to it. Instrumentation
+   (visualize_ladder_stages.py, chunk maps + subgraph stats) showed the
+   edge ladder's stage 3 cuts ZERO edges — its ~24 kept tokens are purely
+   stage-2 islands.
+7. **Two enclosure-aware routers tried** (--router_kind on the ladder):
+   `field` (quantized scalar potential — every cut closes by topology)
+   shattered stage 1 into singletons (97-99% cuts, closure vacuous) then
+   went constant above, sliding into the ISLAND FUNNEL (~9 tokens by
+   ep 125, later routers gradient-frozen). `component` (border = only
+   component-separating cuts) collapsed to 6 island tokens by ep 25 —
+   zero valid edges downstream = zero gradient, terminal. Root cause of
+   both: budgets were CAPS with no floor; islands are free retention.
+8. **Fix that holds: --budget_floor (exact-K per stage** — borders take
+   priority, accumulated evidence fills the deficit). AEL_compfloor_4px:
+   rates pinned exactly 784/196/49 and val rec 0.361 at epoch 50 —
+   equal to the edge ladder's FINAL 300-epoch value at 1/6 the epochs.
+   The routers still barely cut (retention is mostly evidence-fill +
+   islands): enclosure-chunking remains UNACHIEVED; exact-K + evidence
+   ranking is empirically the strongest AE mechanism so far.
+9. **The session's law: any degree of freedom that lets the router
+   modulate HOW MANY tokens survive gets used to escape the
+   reconstruction task; only architecturally fixed quantities hold.**
+   (Corners found to date: keep-all, threshold-parking x2, pool-thrash,
+   slit-mesh border inflation, island under-supply x2, field shatter.)
+10. Open next: why routers under-cut even with rates pinned (do cuts help
+    rec at all under exact-K?); enclosure via region parametrization
+    (differentiable superpixels) rather than cut fields; probe of
+    compfloor when done; distillation/JEPA objective.
 
 Cloud lessons (2026-07-15/16): wandb GCS 403 outage (~1 h) and an HF 502
 each killed runs at boot — artifact/dataset I/O now retries with backoff;
