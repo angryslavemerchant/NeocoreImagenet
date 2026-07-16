@@ -123,11 +123,14 @@ then `launch --offer <ID>`. Auto-pick only as a fallback.
 - Instances health-gate themselves at boot (`vast/benchmark.py` vs
   `vast/thresholds.json`) and self-destroy when unhealthy. Failed runs keep
   the instance alive for inspection.
-- **Local-first persistence (since the 2026-07-15 wandb storage outage):**
-  each run writes checkpoints + eval PNGs to `runs/<run_name>/` on the
-  instance (gitignored; `runs/LATEST` points at the newest). wandb is
-  metrics logging only; artifact uploads are opportunistic backups.
-  Successful runs do NOT self-destroy anymore — they print `AWAITING_PULL`;
-  fetch results with `launch.py pull --id <ID>`, verify, then `destroy`.
+- **Run persistence (settled 2026-07-16):** runs write checkpoints + eval
+  PNGs to `runs/<run_name>/` on the instance (`runs/LATEST` points at the
+  newest; `runs/` is gitignored locally too). On success the final
+  checkpoint artifact is uploaded to wandb and **VERIFIED committed**
+  (`art.wait()`), and only then does the instance self-destroy. If the
+  verified upload fails (e.g. a wandb storage outage — 2026-07-15 one ate a
+  run's weights under the old async upload), the instance stays alive
+  printing `AWAITING_PULL`; fetch with `launch.py pull --id <ID>` (scp;
+  account ssh key), then `destroy`.
 - The instance clones this repo from GitHub, so cloud-side changes
   (onstart.sh, thresholds, train args defaults) only take effect after push.

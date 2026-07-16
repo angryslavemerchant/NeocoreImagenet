@@ -13,6 +13,8 @@ benchmark JSON) as a model artifact. Download later with:
 import argparse
 import glob
 import os
+import sys
+import time
 
 import wandb
 
@@ -35,23 +37,40 @@ def main():
         run.log({f"eval/{os.path.basename(p)}": wandb.Image(p) for p in pngs})
         print(f"Logged {len(pngs)} eval image(s)")
 
-    artifact = wandb.Artifact(f"asfnet-ae-{run.id}", type="model")
-    added = False
-    for name in ("best.pt", "latest.pt"):
-        path = os.path.join(args.ckpt_dir, name)
-        if os.path.exists(path):
-            artifact.add_file(path)
-            added = True
-    for path in args.extra:
-        if os.path.exists(path):
-            artifact.add_file(path)
-    if added:
-        try:
-            run.log_artifact(artifact, aliases=["final"])
-            print("Checkpoint artifact uploaded")
-        except Exception as e:
-            print(f"artifact upload failed ({e!r}) — "
-                  f"checkpoints remain in the local run folder")
+    def build_artifact():
+        artifact = wandb.Artifact(f"asfnet-ae-{run.id}", type="model")
+        added = False
+        for name in ("best.pt", "latest.pt"):
+            path = os.path.join(args.ckpt_dir, name)
+            if os.path.exists(path):
+                artifact.add_file(path)
+                added = True
+        for path in args.extra:
+            if os.path.exists(path):
+                artifact.add_file(path)
+        return artifact if added else None
+
+    # The instance SELF-DESTROYS on this script's success, so the upload
+    # must be VERIFIED before we exit 0: log_artifact is async and failed
+    # silently during the 2026-07-15 storage outage — .wait() blocks until
+    # the artifact is actually committed and raises otherwise. On final
+    # failure exit non-zero so run_training.sh keeps the instance alive
+    # (AWAITING_PULL fallback) instead of destroying the only copy.
+    if build_artifact() is not None:
+        for attempt in range(6):
+            try:
+                logged = run.log_artifact(build_artifact(), aliases=["final"])
+                logged.wait()
+                print("Checkpoint artifact uploaded and verified")
+                break
+            except Exception as e:
+                if attempt == 5:
+                    run.finish()
+                    sys.exit(f"artifact upload failed after retries: {e!r}")
+                wait = min(300, 60 * (attempt + 1))
+                print(f"artifact upload failed ({e!r}) — "
+                      f"retry {attempt + 1}/5 in {wait}s")
+                time.sleep(wait)
 
     run.finish()
 

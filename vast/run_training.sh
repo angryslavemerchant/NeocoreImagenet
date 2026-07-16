@@ -36,6 +36,7 @@ fi
 # Other train scripts (e.g. train_linear_probe.py) log metrics to wandb
 # themselves and need no separate eval step. runs/LATEST is written by the
 # train script and points at runs/<run_name>/.
+UPLOAD_OK=1
 if [ "${TRAIN_SCRIPT}" = "train_asfnet_ae.py" ]; then
     RUN_DIR="$(cat runs/LATEST 2>/dev/null || echo checkpoints_asfnet_ae)"
     echo "EVAL_START run_dir=${RUN_DIR}"
@@ -43,19 +44,31 @@ if [ "${TRAIN_SCRIPT}" = "train_asfnet_ae.py" ]; then
         --checkpoint "${RUN_DIR}/best.pt" \
         --output_dir "${RUN_DIR}/viz" || echo "EVAL_FAILED (continuing to upload)"
 
-    # wandb upload is opportunistic (PNG log + backup artifact) — the local
-    # runs/ folder is the system of record since the 2026-07-15 storage
-    # incident; a wandb failure here must never cost us the run folder.
+    # upload_results VERIFIES the final artifact committed (art.wait()) and
+    # exits non-zero otherwise — self-destroy below is gated on that, so a
+    # wandb storage outage can never again destroy the only copy of the
+    # weights (2026-07-15 lesson).
     "$PY" vast/upload_results.py \
         --viz_dir "${RUN_DIR}/viz" \
         --ckpt_dir "${RUN_DIR}" \
-        --extra /workspace/benchmark.json || echo "UPLOAD_FAILED (results remain on-instance)"
+        --extra /workspace/benchmark.json \
+        || { echo "UPLOAD_FAILED (results remain on-instance)"; UPLOAD_OK=0; }
 fi
+# Non-AE scripts (e.g. train_linear_probe.py) log all results to wandb
+# during training and keep no precious on-instance state.
 
 echo "RUN_COMPLETE"
 
-# Local-first persistence: do NOT self-destroy — the results live in runs/
-# on this instance until the local orchestrator pulls them:
-#     python vast/launch.py pull --id ${INSTANCE_ID}
-#     python vast/launch.py destroy --id ${INSTANCE_ID}
-echo "AWAITING_PULL instance=${INSTANCE_ID} dir=runs/"
+if [ -n "${KEEP_ALIVE:-}" ]; then
+    echo "KEEP_ALIVE set — instance left running"
+elif [ "${UPLOAD_OK}" -eq 1 ]; then
+    echo "SELF_DESTROY instance=${INSTANCE_ID}"
+    sleep 30
+    "$VAST_CLI" destroy instance "${INSTANCE_ID}" --api-key "${VAST_API_KEY}" -y \
+        || echo y | "$VAST_CLI" destroy instance "${INSTANCE_ID}" --api-key "${VAST_API_KEY}"
+else
+    # Fallback: results only exist here — hold for a manual/agent pull.
+    #     python vast/launch.py pull --id ${INSTANCE_ID}
+    #     python vast/launch.py destroy --id ${INSTANCE_ID}
+    echo "AWAITING_PULL instance=${INSTANCE_ID} dir=runs/"
+fi
