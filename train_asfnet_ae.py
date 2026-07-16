@@ -36,6 +36,7 @@ from tqdm import tqdm
 from dataset import get_dataloaders
 from model_asfnet_ae import ASFNetAE
 from model_asfnet_ae2 import ASFNetAE2, ASFNetAE2R
+from model_asfnet_ae_ladder import ASFNetAELadder
 from utils import AverageMeter
 
 
@@ -47,6 +48,20 @@ def set_seed(seed: int):
 
 
 def build_model(args):
+    if args.ladder:
+        assert not (args.two_stage or args.keep_budget > 0
+                    or args.keep_ratio_target > 0 or args.xattn_slots > 0), \
+            "--ladder is its own architecture; stage config is fixed in " \
+            "model_asfnet_ae_ladder.py"
+        return ASFNetAELadder(
+            image_size        = args.image_size,
+            patch_size        = args.patch_size,
+            in_channels       = 3,
+            mlp_ratio         = args.mlp_ratio,
+            target_group_size = args.target_group_size,
+            router_proj_dim   = args.router_proj_dim,
+            norm_pix_loss     = not args.no_norm_pix,
+        )
     if args.two_stage:
         assert args.keep_ratio_target == 0, \
             "two_stage has no keep-rate-loss variant"
@@ -229,6 +244,11 @@ def main():
                              "--encoder_blocks is stage 1's depth.")
     parser.add_argument("--encoder2_blocks",     type=int,   default=3)
     parser.add_argument("--target_group_size_2", type=float, default=3.0)
+    parser.add_argument("--ladder", action="store_true",
+                        help="N-stage fine-patch ladder AE (ASFNetAELadder): "
+                             "4x4 patches, budgets 784/196/49, dims 64/128/256. "
+                             "Pass --patch_size 4. Stage config lives in the "
+                             "model file; only shared knobs are read from CLI.")
     parser.add_argument("--stage2", type=str, default="pool",
                         choices=["pool", "retain"],
                         help="pool: stage-2 chunks pooled to group tokens "

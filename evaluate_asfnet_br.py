@@ -42,6 +42,7 @@ from model_asfnet_br import (
 from model_asfnet import gpu_connected_components
 from model_asfnet_ae import ASFNetAE
 from model_asfnet_ae2 import ASFNetAE2, ASFNetAE2R
+from model_asfnet_ae_ladder import ASFNetAELadder
 
 # Reuse the existing viz primitives — evaluate_asfnet2 guards its main().
 from evaluate_asfnet2 import (
@@ -60,7 +61,16 @@ def _load_model(path: str, device: torch.device, ae: bool):
     ckpt = torch.load(path, map_location=device, weights_only=True)
     a = ckpt["args"]
 
-    if ae and a.get("two_stage", False):
+    if ae and a.get("ladder", False):
+        model = ASFNetAELadder(
+            image_size        = a["image_size"],
+            patch_size        = a["patch_size"],
+            mlp_ratio         = a["mlp_ratio"],
+            target_group_size = a["target_group_size"],
+            router_proj_dim   = a["router_proj_dim"],
+            norm_pix_loss     = not a.get("no_norm_pix", False),
+        )
+    elif ae and a.get("two_stage", False):
         kw = dict(
             image_size          = a["image_size"],
             patch_size          = a["patch_size"],
