@@ -26,6 +26,7 @@ Examples:
 
 import argparse
 import json
+import re
 import shutil
 import statistics
 import subprocess
@@ -433,17 +434,30 @@ def cmd_ssh(args):
 
 
 def cmd_pull(args):
-    """Copy the instance's runs/ folder into the local repo's runs/.
-    Instances no longer self-destroy on success — pull, verify, then
-    destroy. Uses `vastai copy` (remote -> local over the Vast copy API)."""
+    """Copy the instance's runs/ folder into the local repo's runs/ via scp.
+    Instances no longer self-destroy on success — pull, verify, then destroy.
+
+    (`vastai copy` is unusable here: it rejects Windows drive-colon paths and
+    then shells out to rsync, which Windows lacks. scp from Windows OpenSSH
+    works; requires the account ssh key — `vastai create ssh-key` — which
+    new instances inherit at boot.)"""
     iid = resolve_id(args)
     dst = ROOT / "runs"
     dst.mkdir(exist_ok=True)
-    src = f"{iid}:/workspace/NeocoreImagenet/runs/"
-    print(f"pulling {src} -> {dst}")
-    out = vast("copy", src, str(dst), raw=False, check=False)
-    print(out)
-    print("verify the folder contents, then: launch.py destroy --id", iid)
+    url = vast("ssh-url", iid, raw=False, check=True).strip()
+    m = re.match(r"ssh://([^@]+)@([^:]+):(\d+)", url)
+    if not m:
+        sys.exit(f"unparseable ssh-url: {url!r}")
+    user, host, port = m.groups()
+    cmd = ["scp", "-r", "-P", port,
+           "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes",
+           f"{user}@{host}:/workspace/NeocoreImagenet/runs/*", str(dst)]
+    print(f"pulling {iid} -> {dst}")
+    proc = subprocess.run(cmd)
+    if proc.returncode != 0:
+        sys.exit(f"scp failed ({proc.returncode}) — is the account ssh key "
+                 f"attached to this instance? (vastai attach ssh)")
+    print(f"pulled. verify contents, then: launch.py destroy --id {iid}")
 
 
 def cmd_destroy(args):
