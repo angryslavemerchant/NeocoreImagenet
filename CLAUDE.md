@@ -84,11 +84,22 @@ rec numbers are NOT comparable across conventions.
      rec 0.218 dropped-only vs single-stage budget25's 0.101 at the same
      rate/convention. **Hard budgets stabilize two-stage training; the
      hierarchy still costs ~2x reconstruction.**
-4. Candidate next: per-stage rate ladder (e.g. stage1 budget 98 → stage2
-   49); warm-start stage 1 + encoder from AE_budget25 and let stage 2 learn
-   on a stationary substrate; dense 49-slot control with no routing (the
-   "price of interpretability" baseline); distillation/JEPA target instead
-   of pixels (probe evidence says pixel targets underorganize semantics).
+4. **Fine-patch ladder (AEL_4px_3stage) — granularity hypothesis supported.**
+   4x4 patches (3136 tokens), 3 budgeted stages 784/196/49, 4.7M params,
+   ~90 s/epoch (~$7.5/300ep). Trained STABLY (no thrash, no keep-all) and
+   — first time for any variant — settled BELOW its final budget: stage 3
+   keeps ~30 of 49 allowed (kept_s1 pinned 784), i.e. retention itself
+   became the operative compression at fine granularity, where chunks have
+   real interiors. Final val rec 0.361 while reconstructing 99.05% of the
+   fine grid from ~30 tokens (~105x token compression; not numerically
+   comparable to 16x16 runs — different patch size and mask rate). Rec was
+   still falling at epoch 300 (undertrained). Weights/panels:
+   runs/AEL_4px_3stage/.
+5. Candidate next: probe the ladder backbone (train_linear_probe.py only
+   loads ASFNetBR — needs a ladder variant); longer ladder training;
+   warm-start experiments; dense 49-slot no-routing control; distillation/
+   JEPA target instead of pixels (probe evidence says pixel targets
+   underorganize semantics).
 
 Cloud lessons (2026-07-15/16): wandb GCS 403 outage (~1 h) and an HF 502
 each killed runs at boot — artifact/dataset I/O now retries with backoff;
