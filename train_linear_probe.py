@@ -46,6 +46,7 @@ from tqdm import tqdm
 
 from dataset import get_dataloaders
 from model_asfnet_br import ASFNetBR
+from model_asfnet_ae_ladder import ASFNetAELadder
 from utils import AverageMeter
 
 
@@ -96,6 +97,18 @@ class ProbeModel(nn.Module):
             p.requires_grad = False
 
     def forward(self, images: torch.Tensor) -> torch.Tensor:
+        if isinstance(self.backbone, ASFNetAELadder):
+            # Ladder: pool the final (~<=49) survivors; the budget already
+            # selected them, so no probe-side topk.
+            feats, pad_mask, *_ = self.backbone.forward_features(images)
+            if self.attn_pool is not None:
+                pooled = self.attn_pool(feats, pad_mask)
+            else:
+                real_mask = (~pad_mask).float()
+                pooled = (feats * real_mask.unsqueeze(-1)).sum(dim=1) \
+                    / real_mask.sum(dim=1, keepdim=True).clamp(min=1)
+            return self.head(pooled)
+
         feats, _, pad_mask, sel, _, _, _, _, s, _ = \
             self.backbone.forward_features(images)
 
@@ -146,6 +159,24 @@ def load_backbone(args, device) -> tuple[ASFNetBR, dict]:
 
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
     a = ckpt["args"]
+
+    if a.get("ladder", False):
+        # Ladder AE: the whole model (minus decoder usage) is the backbone;
+        # keys load 1:1, decoder weights included but unused by the probe.
+        model = ASFNetAELadder(
+            image_size        = a["image_size"],
+            patch_size        = a["patch_size"],
+            mlp_ratio         = a["mlp_ratio"],
+            target_group_size = a["target_group_size"],
+            router_proj_dim   = a["router_proj_dim"],
+            norm_pix_loss     = not a.get("no_norm_pix", False),
+        )
+        sd = {k.replace("_orig_mod.", "", 1): v for k, v in ckpt["model"].items()}
+        model.load_state_dict(sd, strict=True)
+        print(f"Loaded ladder model from {ckpt_path} "
+              f"(AE epoch {ckpt['epoch'] + 1}, {len(sd)} tensors)")
+        model.to(device)
+        return model, a
 
     model = ASFNetBR(
         image_size        = a["image_size"],
@@ -255,7 +286,8 @@ def main():
     wandb.config.update({"ae_args": ae_args, "resolved_topk": topk})
     print(f"Probe: pool={args.pool}, topk={topk or 'all survivors'}")
 
-    model = ProbeModel(backbone, ae_args["d_model"], ae_args["num_heads"],
+    d_feat = backbone.norm.normalized_shape[0]   # final-stage width (works
+    model = ProbeModel(backbone, d_feat, ae_args["num_heads"],  # for ladder too)
                        args.num_classes, args.pool, topk).to(device)
     model = torch.compile(model)
 

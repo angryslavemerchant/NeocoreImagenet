@@ -156,6 +156,8 @@ class ASFNetAELadder(nn.Module):
             l_ratio:   summed router losses
             kept_per_stage: list of 0-dim GPU tensors (mean kept after each
                             stage's budget)
+            stage_keeps: list of (B, N) bool masks — retention AFTER each
+                            stage's budget (for visualisation / probing)
         """
         tokens, coords = self.patch_embed(x)          # (B, N, d0), (N, 2)
         B, N, _ = tokens.shape
@@ -166,6 +168,7 @@ class ASFNetAELadder(nn.Module):
         s_total = tokens.new_zeros(B, N)
         l_ratio = tokens.new_zeros(())
         kept_per_stage = []
+        stage_keeps = []
 
         tok_c, coord_c, pad_mask, sel = tokens, coords, None, None
 
@@ -221,12 +224,13 @@ class ASFNetAELadder(nn.Module):
                 full_post, coords, keep)
 
             kept_per_stage.append(n_keep.float().mean().detach())
+            stage_keeps.append(keep)
 
         for blk in self.main_net:
             tok_c = blk(tok_c, coord_c, pad_mask)
         tok_c = self.norm(tok_c)
 
-        return tok_c, pad_mask, sel, keep, l_ratio, kept_per_stage
+        return tok_c, pad_mask, sel, keep, l_ratio, kept_per_stage, stage_keeps
 
     # ------------------------------------------------------------------
     def _decode(self, feats, pad_mask, sel):
@@ -257,7 +261,7 @@ class ASFNetAELadder(nn.Module):
             mean_groups: stage-1 survivors (post first budget, ~784)
             drop_frac:   final dropped fraction (loss support, ~0.984)
         """
-        feats, pad_mask, sel, keep, l_ratio, kept_per_stage = \
+        feats, pad_mask, sel, keep, l_ratio, kept_per_stage, _stage_keeps = \
             self.forward_features(imgs)
 
         pred = self._decode(feats, pad_mask, sel)      # (B, N, p*p*C)
@@ -280,7 +284,7 @@ class ASFNetAELadder(nn.Module):
     # ------------------------------------------------------------------
     @torch.no_grad()
     def reconstruct(self, imgs: torch.Tensor):
-        feats, pad_mask, sel, keep, _, _ = self.forward_features(imgs)
+        feats, pad_mask, sel, keep, _, _, _ = self.forward_features(imgs)
         pred = self._decode(feats, pad_mask, sel)
         return self.unpatchify(pred.float()), keep
 
