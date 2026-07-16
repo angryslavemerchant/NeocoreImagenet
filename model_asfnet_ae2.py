@@ -31,7 +31,7 @@ import torch
 import torch.nn as nn
 
 from model_asfnet import TransformerBlock
-from model_asfnet_ae import SlotBottleneck
+from model_asfnet_ae import ASFNetAE, SlotBottleneck
 from model_asfnet_br import ASFNetBR2, ASFNetBR2R
 
 
@@ -229,10 +229,14 @@ class ASFNetAE2R(nn.Module):
         decoder_heads:       int   = 4,
         norm_pix_loss:       bool  = True,
         xattn_slots:         int   = 0,
+        keep_budget:         float = 0.0,
     ):
         super().__init__()
         assert (decoder_d_model // decoder_heads) % 4 == 0, \
             "decoder head_dim must be divisible by 4 for 2D RoPE"
+        assert not (keep_budget > 0 and xattn_slots > 0), \
+            "keep_budget (top-k) and xattn_slots (slot compression) are " \
+            "alternative bottlenecks — pick one"
 
         self.patch_size    = patch_size
         self.in_channels   = in_channels
@@ -244,6 +248,10 @@ class ASFNetAE2R(nn.Module):
         # architectural rate limit the pure-retention path lacks. Loss
         # switches to ALL positions (nothing is copied through).
         self.xattn_slots   = xattn_slots
+        # keep_budget > 0: the single-stage hard top-k, applied to the FINAL
+        # survivors, ranked by TOTAL boundary evidence s1 + s2 (evidence
+        # accumulated at either stage). Loss stays on dropped positions.
+        self.keep_budget   = keep_budget
 
         self.backbone = ASFNetBR2R(
             image_size          = image_size,
@@ -285,8 +293,9 @@ class ASFNetAE2R(nn.Module):
             self.slot_read = nn.MultiheadAttention(
                 decoder_d_model, decoder_heads, batch_first=True)
 
-    patchify   = ASFNetAE2.patchify
-    unpatchify = ASFNetAE2.unpatchify
+    patchify      = ASFNetAE2.patchify
+    unpatchify    = ASFNetAE2.unpatchify
+    _apply_budget = ASFNetAE._apply_budget   # same contract; ranks on the s we pass
 
     # ------------------------------------------------------------------
     def _decode(
@@ -342,8 +351,12 @@ class ASFNetAE2R(nn.Module):
                          (the loss support only when xattn_slots == 0)
         """
         feats, _, pad_mask, sel, keep2, l_ratio1, l_ratio2, \
-            mean_kept1, mean_kept2, _s1, _s2, _probs1 = \
+            mean_kept1, mean_kept2, s1, s2, _probs1 = \
             self.backbone.forward_features(imgs)
+
+        if self.keep_budget > 0:
+            pad_mask, keep2 = self._apply_budget(pad_mask, sel, keep2, s1 + s2)
+            mean_kept2 = keep2.float().sum(dim=1).mean().detach()
 
         if self.xattn_slots > 0:
             pred = self._decode_slots(self.slot_bottleneck(feats, pad_mask))
@@ -374,7 +387,10 @@ class ASFNetAE2R(nn.Module):
     @torch.no_grad()
     def reconstruct(self, imgs: torch.Tensor):
         """Same contract as ASFNetAE.reconstruct: (pred_imgs, keep mask)."""
-        feats, _, pad_mask, sel, keep2, *_ = self.backbone.forward_features(imgs)
+        feats, _, pad_mask, sel, keep2, _, _, _, _, s1, s2, _ = \
+            self.backbone.forward_features(imgs)
+        if self.keep_budget > 0:
+            pad_mask, keep2 = self._apply_budget(pad_mask, sel, keep2, s1 + s2)
         if self.xattn_slots > 0:
             pred = self._decode_slots(self.slot_bottleneck(feats, pad_mask))
         else:

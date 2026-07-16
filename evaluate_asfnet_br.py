@@ -79,7 +79,8 @@ def _load_model(path: str, device: torch.device, ae: bool):
             norm_pix_loss       = not a.get("no_norm_pix", False),
         )
         if a.get("stage2") == "retain":
-            model = ASFNetAE2R(**kw, xattn_slots=a.get("xattn_slots", 0))
+            model = ASFNetAE2R(**kw, xattn_slots=a.get("xattn_slots", 0),
+                               keep_budget=a.get("keep_budget", 0.0))
         else:
             model = ASFNetAE2(**kw)
     elif ae:
