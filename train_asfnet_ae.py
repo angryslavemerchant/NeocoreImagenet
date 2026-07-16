@@ -53,6 +53,9 @@ def build_model(args):
                     or args.keep_ratio_target > 0 or args.xattn_slots > 0), \
             "--ladder is its own architecture; stage config is fixed in " \
             "model_asfnet_ae_ladder.py"
+        kw = {}
+        if args.ladder_budgets is not None:
+            kw["stage_budgets"] = tuple(args.ladder_budgets)
         return ASFNetAELadder(
             image_size        = args.image_size,
             patch_size        = args.patch_size,
@@ -63,6 +66,8 @@ def build_model(args):
             norm_pix_loss     = not args.no_norm_pix,
             router_kind       = args.router_kind,
             budget_floor      = args.budget_floor,
+            ghost_grid        = args.ghost_grid,
+            **kw,
         )
     if args.two_stage:
         assert args.keep_ratio_target == 0, \
@@ -254,6 +259,14 @@ def main():
                              "loss. component: edge cuts but border-ness only "
                              "from cuts that separate true connected components "
                              "(slits count for nothing).")
+    parser.add_argument("--ghost_grid", action="store_true",
+                        help="ladder only: dropped tokens stay on the grid as "
+                             "frozen ghosts — all edges routable, chunks merge "
+                             "across gaps, resurrection allowed; attention "
+                             "still runs on the kept set only.")
+    parser.add_argument("--ladder_budgets", type=int, nargs=3, default=None,
+                        help="override the ladder's per-stage budgets, e.g. "
+                             "'0 0 196' (0 = uncapped stage).")
     parser.add_argument("--budget_floor", action="store_true",
                         help="ladder only: keep EXACTLY the budget per stage "
                              "(borders first, evidence fills the deficit) — "

@@ -218,20 +218,36 @@ class ASFNetAELadder(nn.Module):
         norm_pix_loss:     bool  = True,
         router_kind:       str   = "edge",
         budget_floor:      bool  = False,
+        ghost_grid:        bool  = False,
     ):
         super().__init__()
         assert len(stage_dims) == len(stage_heads) == len(stage_blocks) \
             == len(stage_budgets)
+        # budget 0 = uncapped stage (pure retention); positive budgets cap
+        # (and with budget_floor, pin exactly).
+        assert all(b >= 0 for b in stage_budgets)
         self.router_kind = router_kind
+        # ghost_grid: dropped tokens leave COMPUTATION but never leave the
+        # GRID. Their features persist as stale "ghosts" (re-projected each
+        # stage so widths match); every grid edge stays routable, so chunks
+        # can merge ACROSS dropped regions and borders are computed on the
+        # full 56x56 geometry at every stage. Tokens can be resurrected when
+        # a coarser chunk's frontier lands on them. Attention still runs
+        # only on the kept set — compute stays budget-pinned.
+        self.ghost_grid = ghost_grid
         # budget_floor: keep EXACTLY K per stage — border tokens first, then
         # highest-evidence survivors fill any deficit. Added 2026-07-16 after
         # two under-supply collapses: budgets-as-caps let routers go zero-cut
         # and ride the island guard down to a handful of tokens, at which
         # point later routers receive zero gradient (no valid edges) and
         # freeze. A floor makes the rate a true architectural constant.
+        # (Without ghost_grid the fill candidates are the current survivors,
+        # so a starved stage keeps min(K, survivors); with ghost_grid the
+        # candidates are ALL tokens — resurrection.)
         self.budget_floor = budget_floor
-        assert all(a > b for a, b in zip(stage_budgets, stage_budgets[1:])), \
-            "budgets must strictly decrease"
+        pos = [b for b in stage_budgets if b > 0]
+        assert all(a > b for a, b in zip(pos, pos[1:])), \
+            "positive budgets must strictly decrease"
         assert (decoder_d_model // decoder_heads) % 4 == 0
 
         self.patch_size    = patch_size
@@ -240,7 +256,7 @@ class ASFNetAELadder(nn.Module):
         self.n_patches     = self.grid_size ** 2
         self.norm_pix_loss = norm_pix_loss
         self.target_group_size = target_group_size
-        assert stage_budgets[0] < self.n_patches
+        assert all(b < self.n_patches for b in stage_budgets if b > 0)
 
         self.patch_embed = PatchEmbed(image_size, patch_size, in_channels,
                                       stage_dims[0])
@@ -287,8 +303,13 @@ class ASFNetAELadder(nn.Module):
         return x.permute(0, 5, 1, 3, 2, 4).reshape(B, C, g * p, g * p)
 
     # ------------------------------------------------------------------
-    def forward_features(self, x: torch.Tensor):
+    def forward_features(self, x: torch.Tensor,
+                         collect_router_data: bool = False):
         """
+        collect_router_data=True additionally stashes
+        self._router_trace = [(router_keep, hard, valid), ...] per stage
+        (for visualisation; never set during training).
+
         Returns:
             feats:     (B, K_last, D) post-norm final survivors
             pad_mask:  (B, K_last)
@@ -310,80 +331,147 @@ class ASFNetAELadder(nn.Module):
         l_ratio = tokens.new_zeros(())
         kept_per_stage = []
         stage_keeps = []
+        if collect_router_data:
+            self._router_trace = []
 
-        tok_c, coord_c, pad_mask, sel = tokens, coords, None, None
+        if self.ghost_grid:
+            # ---------- ghost path: full grid persists; attention on kept ----------
+            buf = tokens                                    # (B, N, d) persistent
+            all_keep = torch.ones_like(keep)
+            for stage in self.stages:
+                buf = stage.proj(buf)                       # ghosts re-projected too
+                d = buf.shape[-1]
 
-        for stage in self.stages:
-            tok_c = stage.proj(tok_c)
-            for blk in stage.blocks:
-                tok_c = blk(tok_c, coord_c, pad_mask)   # None mask -> flash
-            d = tok_c.shape[-1]
+                tok_c, coord_c, pad_mask, sel, _ = compact_survivors(
+                    buf, coords, keep)
+                for blk in stage.blocks:
+                    tok_c = blk(tok_c, coord_c, pad_mask)
+                # write updated survivors back; pad slots must NOT clobber
+                # ghost values at the dropped positions they point at
+                stale  = buf.gather(1, sel.unsqueeze(-1).expand(-1, -1, d))
+                tok_up = torch.where(pad_mask.unsqueeze(-1), stale, tok_c)
+                buf = buf.scatter(1, sel.unsqueeze(-1).expand(-1, -1, d), tok_up)
 
-            # Full-grid layout for routing (stage 1 already is full-grid).
-            if sel is None:
-                full = tok_c
-            else:
-                full = tok_c.new_zeros(B, N, d)
-                full = full.scatter(
-                    1, sel.unsqueeze(-1).expand(-1, -1, d), tok_c)
+                # route on the FULL grid — every edge routable through ghosts
+                hard, probs, valid, l_r = stage.router(
+                    buf, all_keep, self.target_group_size)
+                l_ratio = l_ratio + l_r
+                if collect_router_data:
+                    self._router_trace.append(
+                        (all_keep.clone(), hard.detach().clone(), valid.clone()))
 
-            hard, probs, valid, l_r = stage.router(
-                full, keep, self.target_group_size)
-            l_ratio = l_ratio + l_r
+                pw  = probs * valid.to(probs.dtype)
+                s_k = pw.new_zeros(B, N)
+                s_k = s_k.index_add(1, idx_i, pw).index_add(1, idx_j, pw)
+                s_total = s_total + s_k
+                buf = buf + s_k.unsqueeze(-1) * buf         # residual, full grid
 
-            # Differentiable evidence on valid edges (router's grad path).
-            pw  = probs * valid.to(probs.dtype)
-            s_k = pw.new_zeros(B, N)
-            s_k = s_k.index_add(1, idx_i, pw).index_add(1, idx_j, pw)
-            s_total = s_total + s_k
+                if self.router_kind == "component":
+                    new_keep = component_border_keep(hard, valid, ei, N, all_keep)
+                else:
+                    new_keep = masked_border_keep(hard, valid, ei, N, all_keep)
+                # zero-cut guard: nothing is border -> every token is a
+                # candidate; the budget below still picks K
+                new_keep = new_keep | (new_keep.sum(dim=1, keepdim=True) == 0)
 
-            s_slot = s_k if sel is None else s_k.gather(1, sel)
-            tok_c  = tok_c + s_slot.unsqueeze(-1) * tok_c
+                K = stage.budget_tokens
+                if K > 0 and self.budget_floor:
+                    # candidates = ALL tokens (resurrection allowed)
+                    scores = s_total.detach() + 1e6 * new_keep.float()
+                    top  = scores.topk(K, dim=1).indices
+                    keep = torch.zeros_like(keep).scatter(1, top, True)
+                elif K > 0:
+                    scores = s_total.detach().masked_fill(~new_keep, float("-inf"))
+                    top    = scores.topk(K, dim=1).indices
+                    capped = torch.zeros_like(new_keep).scatter(1, top, True) & new_keep
+                    over   = new_keep.sum(dim=1, keepdim=True) > K
+                    keep   = torch.where(over, capped, new_keep)
+                else:
+                    keep = new_keep
 
-            # Border retention on the survivor subgraph, then the budget.
-            # edge/field: any incident (valid) cut confers border-ness —
-            #   for the field router every cut separates BY CONSTRUCTION.
-            # component: only cuts that separate true connected components
-            #   count (slits confer nothing).
-            if self.router_kind == "component":
-                new_keep = component_border_keep(hard, valid, ei, N, keep)
-            else:
-                new_keep = masked_border_keep(hard, valid, ei, N, keep)
-            new_keep = new_keep | (keep & (new_keep.sum(dim=1, keepdim=True) == 0))
+                kept_per_stage.append(keep.float().sum(dim=1).mean().detach())
+                stage_keeps.append(keep)
 
-            K = stage.budget_tokens
-            if self.budget_floor:
-                # Exact-K: borders outrank everything (BIG bonus), evidence
-                # breaks ties and fills the deficit from the remaining
-                # survivors. keep_prev >= K holds by the ladder's strictly
-                # decreasing budgets, so exactly K survive every stage.
-                scores = (s_total.detach()
-                          + 1e6 * new_keep.float()).masked_fill(
-                              ~keep, float("-inf"))
-                top  = scores.topk(K, dim=1).indices
-                keep = torch.zeros_like(keep).scatter(1, top, True)
-            else:
-                scores = s_total.detach().masked_fill(~new_keep, float("-inf"))
-                top    = scores.topk(K, dim=1).indices
-                capped = torch.zeros_like(new_keep)
-                capped = capped.scatter(1, top, True) & new_keep
-                over   = new_keep.sum(dim=1, keepdim=True) > K
-                keep   = torch.where(over, capped, new_keep)
+            tok_c, coord_c, pad_mask, sel, _ = compact_survivors(buf, coords, keep)
 
-            # Compact the (post-residual) survivors for the next stage —
-            # sequence length from here on is bounded by K: memory is
-            # rate-pinned by construction.
-            if sel is None:
-                full_post = tok_c
-            else:
-                full_post = tok_c.new_zeros(B, N, d)
-                full_post = full_post.scatter(
-                    1, sel.unsqueeze(-1).expand(-1, -1, d), tok_c)
-            tok_c, coord_c, pad_mask, sel, n_keep = compact_survivors(
-                full_post, coords, keep)
+        else:
+            # ---------- original path: dropped tokens leave the grid ----------
+            tok_c, coord_c, pad_mask, sel = tokens, coords, None, None
 
-            kept_per_stage.append(n_keep.float().mean().detach())
-            stage_keeps.append(keep)
+            for stage in self.stages:
+                tok_c = stage.proj(tok_c)
+                for blk in stage.blocks:
+                    tok_c = blk(tok_c, coord_c, pad_mask)   # None mask -> flash
+                d = tok_c.shape[-1]
+
+                # Full-grid layout for routing (stage 1 already is full-grid).
+                if sel is None:
+                    full = tok_c
+                else:
+                    full = tok_c.new_zeros(B, N, d)
+                    full = full.scatter(
+                        1, sel.unsqueeze(-1).expand(-1, -1, d), tok_c)
+
+                hard, probs, valid, l_r = stage.router(
+                    full, keep, self.target_group_size)
+                l_ratio = l_ratio + l_r
+                if collect_router_data:
+                    self._router_trace.append(
+                        (keep.clone(), hard.detach().clone(), valid.clone()))
+
+                # Differentiable evidence on valid edges (router's grad path).
+                pw  = probs * valid.to(probs.dtype)
+                s_k = pw.new_zeros(B, N)
+                s_k = s_k.index_add(1, idx_i, pw).index_add(1, idx_j, pw)
+                s_total = s_total + s_k
+
+                s_slot = s_k if sel is None else s_k.gather(1, sel)
+                tok_c  = tok_c + s_slot.unsqueeze(-1) * tok_c
+
+                # Border retention on the survivor subgraph, then the budget.
+                # edge/field: any incident (valid) cut confers border-ness —
+                #   for the field router every cut separates BY CONSTRUCTION.
+                # component: only cuts that separate true connected components
+                #   count (slits confer nothing).
+                if self.router_kind == "component":
+                    new_keep = component_border_keep(hard, valid, ei, N, keep)
+                else:
+                    new_keep = masked_border_keep(hard, valid, ei, N, keep)
+                new_keep = new_keep | (keep & (new_keep.sum(dim=1, keepdim=True) == 0))
+
+                K = stage.budget_tokens
+                if K > 0 and self.budget_floor:
+                    # Exact-K when enough survivors exist: borders outrank
+                    # everything (BIG bonus), evidence fills the deficit.
+                    # The final AND keeps a starved stage at min(K, survivors)
+                    # instead of selecting junk positions.
+                    scores = (s_total.detach()
+                              + 1e6 * new_keep.float()).masked_fill(
+                                  ~keep, float("-inf"))
+                    top  = scores.topk(K, dim=1).indices
+                    keep = torch.zeros_like(keep).scatter(1, top, True) & keep
+                elif K > 0:
+                    scores = s_total.detach().masked_fill(~new_keep, float("-inf"))
+                    top    = scores.topk(K, dim=1).indices
+                    capped = torch.zeros_like(new_keep)
+                    capped = capped.scatter(1, top, True) & new_keep
+                    over   = new_keep.sum(dim=1, keepdim=True) > K
+                    keep   = torch.where(over, capped, new_keep)
+                else:
+                    keep = new_keep       # uncapped stage: pure retention
+
+                # Compact the (post-residual) survivors for the next stage.
+                if sel is None:
+                    full_post = tok_c
+                else:
+                    full_post = tok_c.new_zeros(B, N, d)
+                    full_post = full_post.scatter(
+                        1, sel.unsqueeze(-1).expand(-1, -1, d), tok_c)
+                tok_c, coord_c, pad_mask, sel, n_keep = compact_survivors(
+                    full_post, coords, keep)
+
+                kept_per_stage.append(n_keep.float().mean().detach())
+                stage_keeps.append(keep)
 
         for blk in self.main_net:
             tok_c = blk(tok_c, coord_c, pad_mask)

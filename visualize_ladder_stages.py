@@ -152,6 +152,9 @@ def main():
     ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
     a = ckpt["args"]
     assert a.get("ladder"), "not a ladder checkpoint"
+    lkw = {}
+    if a.get("ladder_budgets"):
+        lkw["stage_budgets"] = tuple(a["ladder_budgets"])
     model = ASFNetAELadder(
         image_size        = a["image_size"],
         patch_size        = a["patch_size"],
@@ -161,6 +164,8 @@ def main():
         norm_pix_loss     = not a.get("no_norm_pix", False),
         router_kind       = a.get("router_kind", "edge"),
         budget_floor      = a.get("budget_floor", False),
+        ghost_grid        = a.get("ghost_grid", False),
+        **lkw,
     )
     sd = {k.replace("_orig_mod.", "", 1): v for k, v in ckpt["model"].items()}
     model.load_state_dict(sd, strict=True)
@@ -171,48 +176,14 @@ def main():
     print(f"streamed {len(imgs)} val images")
 
     feats, pad_mask, sel, keep, _, kept_means, stage_keeps = \
-        model.forward_features(imgs)
+        model.forward_features(imgs, collect_router_data=True)
+    stage_cutdata = model._router_trace
     recon, _ = model.reconstruct(imgs)
 
-    # per-stage subgraph stats (rerun routers on the recorded keeps),
-    # collecting (keep_prev, hard, valid) for the chunk maps
     print("\nper-stage survivor-subgraph statistics:")
-    stage_cutdata = []
-    keep_prev = torch.ones_like(stage_keeps[0])
-    tokens, coords = model.patch_embed(imgs)
-    tok_c, coord_c, pm, sl = tokens, coords, None, None
-    from model_asfnet_br import compact_survivors
-    for i, stage in enumerate(model.stages):
-        tok_c = stage.proj(tok_c)
-        for blk in stage.blocks:
-            tok_c = blk(tok_c, coord_c, pm)
-        d = tok_c.shape[-1]
-        if sl is None:
-            full = tok_c
-        else:
-            full = tok_c.new_zeros(imgs.shape[0], model.n_patches, d)
-            full = full.scatter(1, sl.unsqueeze(-1).expand(-1, -1, d), tok_c)
-        hard, probs, valid, _ = stage.router(full, keep_prev,
-                                             model.target_group_size)
-        print(f"  stage {i + 1}: {subgraph_stats(model, keep_prev, hard, valid)}"
+    for i, (kp, hard, valid) in enumerate(stage_cutdata):
+        print(f"  stage {i + 1}: {subgraph_stats(model, kp, hard, valid)}"
               f"  -> kept {stage_keeps[i].sum(dim=1).float().mean():.1f}")
-        stage_cutdata.append((keep_prev.clone(), hard.clone(), valid.clone()))
-        # replay the residual+compact so stage i+1 sees the right features
-        ei = stage.router.edge_indices
-        pw = probs * valid.to(probs.dtype)
-        s_k = pw.new_zeros(pw.shape[0], model.n_patches)
-        s_k = s_k.index_add(1, ei[:, 0], pw).index_add(1, ei[:, 1], pw)
-        s_slot = s_k if sl is None else s_k.gather(1, sl)
-        tok_c = tok_c + s_slot.unsqueeze(-1) * tok_c
-        if sl is None:
-            full_post = tok_c
-        else:
-            full_post = tok_c.new_zeros(imgs.shape[0], model.n_patches, d)
-            full_post = full_post.scatter(
-                1, sl.unsqueeze(-1).expand(-1, -1, d), tok_c)
-        keep_prev = stage_keeps[i]
-        tok_c, coord_c, pm, sl, _ = compact_survivors(full_post, coords,
-                                                      keep_prev)
 
     # ---- panel: original | per stage (chunk map, keep) | reconstruction ----
     g, p = model.grid_size, model.patch_size

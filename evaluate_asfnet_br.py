@@ -62,6 +62,9 @@ def _load_model(path: str, device: torch.device, ae: bool):
     a = ckpt["args"]
 
     if ae and a.get("ladder", False):
+        lkw = {}
+        if a.get("ladder_budgets"):
+            lkw["stage_budgets"] = tuple(a["ladder_budgets"])
         model = ASFNetAELadder(
             image_size        = a["image_size"],
             patch_size        = a["patch_size"],
@@ -71,6 +74,8 @@ def _load_model(path: str, device: torch.device, ae: bool):
             norm_pix_loss     = not a.get("no_norm_pix", False),
             router_kind       = a.get("router_kind", "edge"),
             budget_floor      = a.get("budget_floor", False),
+            ghost_grid        = a.get("ghost_grid", False),
+            **lkw,
         )
     elif ae and a.get("two_stage", False):
         kw = dict(

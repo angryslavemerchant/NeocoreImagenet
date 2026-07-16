@@ -163,6 +163,9 @@ def load_backbone(args, device) -> tuple[ASFNetBR, dict]:
     if a.get("ladder", False):
         # Ladder AE: the whole model (minus decoder usage) is the backbone;
         # keys load 1:1, decoder weights included but unused by the probe.
+        lkw = {}
+        if a.get("ladder_budgets"):
+            lkw["stage_budgets"] = tuple(a["ladder_budgets"])
         model = ASFNetAELadder(
             image_size        = a["image_size"],
             patch_size        = a["patch_size"],
@@ -172,6 +175,8 @@ def load_backbone(args, device) -> tuple[ASFNetBR, dict]:
             norm_pix_loss     = not a.get("no_norm_pix", False),
             router_kind       = a.get("router_kind", "edge"),
             budget_floor      = a.get("budget_floor", False),
+            ghost_grid        = a.get("ghost_grid", False),
+            **lkw,
         )
         sd = {k.replace("_orig_mod.", "", 1): v for k, v in ckpt["model"].items()}
         model.load_state_dict(sd, strict=True)
