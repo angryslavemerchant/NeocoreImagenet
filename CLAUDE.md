@@ -51,6 +51,51 @@ Agreed next directions (not started): budget annealing for A (e.g. 0.9 →
 0.25), rate-distortion learnable K, fine-tune script (small variant of
 train_linear_probe.py with everything unfrozen + lower LR).
 
+## Research checkpoint (2026-07-16) — probes, slots, and the two-stage AEs
+
+All checkpoints + eval panels now live in local `runs/<run_name>/`
+(wandb = metrics only). Loss conventions: "dropped-only" vs "all-position"
+rec numbers are NOT comparable across conventions.
+
+1. **Probe grid on frozen AE_budget25** (180 epochs each): attentive+ALL
+   survivors **32.0%** top-1 / 59.3% top-5; attentive+top49 26.5%;
+   mean+top49 12.1% (original mean+all 50ep: 8.3%). Lessons: the attentive
+   (MAP) head is the dominant factor (+14pt); restricting to the 49
+   reconstruction-graded tokens HURTS (-5.5pt) — the other ~140 survivors
+   carry real class signal; the old 8.3% was a measurement artifact.
+2. **Single-stage slot bottleneck (AE_xattn49) works**: 49 learned queries
+   cross-attend over survivors, Perceiver-IO decode, loss on ALL positions.
+   val rec 0.211 (original) / 0.227 (resume from ep174 after the 2026-07-15
+   wandb storage outage ate the original's final weights; resume weights
+   are in runs/AE_xattn49_resume/). Router stayed non-degenerate (~26% drop).
+3. **Two-stage AE head-to-head (all 300 ep, enc 3+3, main 6) — hierarchy
+   is currently an optimization problem, not a capacity one:**
+   - pool (AE2): router2 group count THRASHED 1.7↔91 all run; rec 0.62
+     all-position. Hypothesis: group count is a percolation quantity and
+     tgs=3 sits near criticality; two stacked near-critical routers drive
+     each other.
+   - double retention (AE2BR): keep-all basin, only 12.5% dropped,
+     rec 0.116 dropped-only = trivial. Same corner as the single-stage
+     baseline collapse.
+   - double retention + 49 slots: total collapse — routers thrashed, slots
+     output a constant, rec pinned at 1.00 all-position from epoch 26.
+   - double retention + budget 49 (rank by s1+s2): the ONLY stable
+     two-stage — drop pinned 0.75, kept2=49, smooth descent — but final
+     rec 0.218 dropped-only vs single-stage budget25's 0.101 at the same
+     rate/convention. **Hard budgets stabilize two-stage training; the
+     hierarchy still costs ~2x reconstruction.**
+4. Candidate next: per-stage rate ladder (e.g. stage1 budget 98 → stage2
+   49); warm-start stage 1 + encoder from AE_budget25 and let stage 2 learn
+   on a stationary substrate; dense 49-slot control with no routing (the
+   "price of interpretability" baseline); distillation/JEPA target instead
+   of pixels (probe evidence says pixel targets underorganize semantics).
+
+Cloud lessons (2026-07-15/16): wandb GCS 403 outage (~1 h) and an HF 502
+each killed runs at boot — artifact/dataset I/O now retries with backoff;
+successful runs AWAIT PULL (`launch.py pull`, scp + account ssh key)
+instead of self-destroying; known-bad machines list grew (m48680 GPU hang,
+m140634 zombie boot).
+
 ## Local environment (Windows)
 
 - No `python` on PATH. The project env is the `ToastEnv` conda env:
