@@ -135,6 +135,11 @@ def run_epoch(model, loader, optimizer, args, epoch, device,
             t_iter = time.perf_counter()
 
     epoch_sec = time.perf_counter() - t_epoch
+    # data_wait_frac counts time blocked in the loader's __next__ — under
+    # async CUDA the CPU races ahead and drains the GPU's queue THERE, so
+    # a compute-bound run can read 85% "data wait" (measured 2026-07-17:
+    # RAM loader + DALI identical epoch times, nvidia-smi 100% util).
+    # Treat it as an upper bound on loader stall, not a measurement.
     sys_stats = {
         f"sys/{tag}_epoch_sec":      round(epoch_sec, 1),
         f"sys/{tag}_imgs_per_sec":   round(n_images / max(epoch_sec, 1e-9), 1),
