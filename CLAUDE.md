@@ -223,12 +223,18 @@ partial activation checkpointing (batch 1024 uncheckpointed OOMs at
 6. **Trainability**: R7 hit two loss spikes at lr 3e-3 (ep 30, ep 41 →
    0.78), both self-recovered under grad-clip 1.0; R2/R4 smooth. Deeper
    recursion wants a gentler lr.
-7. **Probes (attentive, 180 ep, project `asfnet`)**: R1 memory-49
-   28.8% / all-196 35.5% top-1 (budget25 equivalents 26.5 / 32.0 — the
-   Neocore encoder is better even one-shot). The memory-vs-all gap
-   (6.7 pt at R1) is the number recursion must shrink for the
-   "admission concentrates class signal" story. R7 mem/all + R2 mem
-   probes in flight at time of writing.
+7. **Probes (attentive, 180 ep, project `asfnet`) — REC AND PROBE
+   DIVERGE AS R GROWS.** Top-1, mem49 / all196: budget25 26.5 / 32.0 ·
+   R1 28.8 / 35.5 · R2 29.5 / — · R7 **26.3 / 32.6** (R4 probe
+   cancelled by user — trend clear). Recursion monotonically improves
+   reconstruction yet R7 LOSES ~2.5 pt (memory) and ~3 pt (all-196) vs
+   R1; R2 is the probe sweet spot so far. The memory-vs-all gap stays
+   ~6 pt at every R — recursion did NOT concentrate class signal into
+   memory. Reading: extra weight-shared passes specialize features for
+   the decoder (texture/position detail) at the expense of linearly
+   separable semantics — the loop optimizes exactly what it's asked to
+   and nothing else. Objective, not architecture, is what moves the
+   probe (distill/JEPA/fine-tune next if probe numbers are the goal).
 8. **Compute-bound correction**: the "85% data-wait" metric was an
    async-CUDA accounting artifact (CPU blocks at the iterator sync point;
    GPU drain lands there). Proof: RAM loader and DALI produce identical
