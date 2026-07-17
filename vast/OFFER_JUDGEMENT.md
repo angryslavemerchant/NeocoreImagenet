@@ -6,23 +6,29 @@ below, then `launch.py launch --offer <ID>`.
 
 ## User briefing (2026-07-17) — authoritative, supersedes GPU-class rules below
 
-1. **Default GPU class: single RTX 5090 (`RTX_5090`, num_gpus=1).** The
-   user cut the burn rate: 96 GB cards were overkill for these ~6 M-param
-   models. RTX PRO 6000 WS / B200 only when the user explicitly asks for a
-   fast run. Market at briefing time: 45 offers, floor $0.296/hr, median
-   $0.497/hr. Default cap $0.60/hr.
-2. **Training recipe on a 5090 (32 GB)** — launch.py's default train-args:
-   batch 256, lr 7.5e-4 (linearly rescaled from the 1024/3e-3 recipe),
-   `--data ram` with the blob in **system RAM** (the 25 GB train blob does
-   not fit in 32 GB VRAM — never pass `--data_device cuda` on this class),
-   `--compile_mode default`, `--checkpoint_rounds 3` (loop archs; ~15 GB
-   for R7 at batch 256). Expect ~2x the PRO-6000 epoch time (~160 s for an
-   R7-class run) at roughly half the hourly cost.
-3. **CPU rules relax on this class**: the 5090 market is nearly all EPYC
+1. **GPU profiles (`launch.py --profile {5090,6000,b200}`)** — each sets
+   gpu_name, price cap, and the matched training recipe (explicit
+   `--train-args` replaces the recipe wholesale); pick per run by what
+   the user wants that day:
+   - **`5090` (default, the workhorse — overnight runs). Hard cap
+     $0.38/hr** (user-set; floor ~$0.30, so shop the $0.30–0.38 band).
+     Recipe: batch 256, lr 7.5e-4 (linearly rescaled from 1024/3e-3),
+     `--data ram` with the blob in **system RAM** (25 GB does not fit
+     32 GB VRAM — never `--data_device cuda` here), `--compile_mode
+     default`, `--checkpoint_rounds 3` (~15 GB for loop-R7). Expect ~2x
+     PRO-6000 epoch time (~160 s for an R7-class run).
+   - **`6000` (RTX PRO 6000 WS, 96 GB) — fast same-day results when the
+     user is optimistic about an idea.** Cap $1.2/hr. The proven recipe:
+     batch 1024, lr 3e-3, `--data ram --data_device cuda`, ck3.
+   - **`b200` — occasional very fast runs, user-approved only.** Profile
+     cap $8/hr but the market floor hovers near it (~$6.9/hr at
+     briefing) — confirm price with the user first. Batch 1024, no
+     checkpointing (180 GB).
+2. **CPU rules relax on the 5090 class**: that market is nearly all EPYC
    hosts, and with the RAM-blob loader (GPU-side aug, torch-only) training
    is GPU-bound — EPYC is fine now. Still avoid the genuine toasters
    (6-core Ryzen 3600 / 7500F class). **cpu_ram ≥ 48 GB is a hard
-   requirement** (25 GB blob lives in system RAM).
+   requirement on every profile** (25 GB blob builds/lives in system RAM).
 
 ## User briefing (2026-07-14) — GPU-class rules superseded above
 

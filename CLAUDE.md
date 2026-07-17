@@ -283,15 +283,19 @@ call by the operating agent**: run `search`, apply `vast/OFFER_JUDGEMENT.md`
 (price near the middle of the range, known-bad machine list), then
 `launch --offer <ID>`. Auto-pick only as a fallback.
 
-**Fleet policy (user directive 2026-07-17): single RTX 5090 per run is the
-default** — the 96 GB cards were burn-rate overkill for ~6 M-param models.
-5090 recipe (launch.py's default train-args): batch 256, lr 7.5e-4
-(linear-scaled from the 1024 / 3e-3 recipe), `--data ram` with blobs in
-**system RAM** (25 GB blob does not fit 32 GB VRAM — no `--data_device
-cuda` on this class), `--compile_mode default`, `--checkpoint_rounds 3`.
-EPYC hosts are fine now (RAM loader is GPU-bound); cpu_ram ≥ 48 GB
-required. Expect ~2x PRO-6000 epoch time at ~half the hourly cost.
-RTX_PRO_6000_WS / B200 only when the user explicitly asks for a fast run.
+**Fleet policy (user directive 2026-07-17): GPU profiles** — `launch.py
+--profile {5090,6000,b200}` sets gpu_name, price cap, AND the matched
+training recipe (batch/lr/data placement/compile/checkpointing; explicit
+`--train-args` replaces it wholesale). `5090` is the default workhorse
+(overnight runs, **hard cap $0.38/hr**): batch 256, lr 7.5e-4
+(linear-scaled from 1024/3e-3), `--data ram` blobs in **system RAM**
+(25 GB doesn't fit 32 GB VRAM — never `--data_device cuda` on 5090s),
+compile default, ck3; ~2x PRO-6000 epoch time (~160 s R7-class). `6000`
+= the proven batch-1024/3e-3 VRAM-resident recipe for user-requested
+same-day results ($1.2/hr cap). `b200` = user-approved-only rapid runs
+(floor ~$6.9/hr). EPYC hosts fine on 5090s (RAM loader is GPU-bound);
+cpu_ram ≥ 48 GB required everywhere. Batch-256 runs are not strictly
+comparable to the batch-1024 series — compare within a recipe.
 
 ```powershell
 & "C:\Users\JmgLi\anaconda3\envs\ToastEnv\python.exe" vast\launch.py status

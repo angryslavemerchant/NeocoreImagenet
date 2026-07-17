@@ -6,8 +6,9 @@ Runs on the local machine (Windows: use the Anaconda python). Wraps the
 live instances is kept in .vast/instances.json (gitignored).
 
 Commands:
-    search   [--gpu RTX_4090] [--max-dph 0.6]        list candidate offers
-    launch   [--offer ID] [--train-args "..."]       rent + provision + train
+    search   [--profile 5090|6000|b200]              list candidate offers
+    launch   [--offer ID] [--profile ...]            rent + provision + train
+             [--train-args "..."]                    (replaces profile recipe)
     scan     [--n 3]                                 bench-only pass over N
                                                      instances, suggest gate
                                                      thresholds, self-destroy
@@ -59,6 +60,44 @@ TEMPLATE_ENV = (
     'localhost:6006:16006:/:Tensorboard"'
 )
 DISK_GB   = 80
+
+# Per-class training profiles (user directive 2026-07-17): the 5090 is the
+# workhorse (overnight runs, cap $0.38/hr); 6000 Blackwell / B200 are
+# opt-in fast lanes when the user wants a same-day result. Each profile
+# carries the Vast gpu_name, price cap, and the hyperparameter fragment
+# appended to the base train args. lr follows linear scaling from the
+# proven batch-1024 / 3e-3 recipe.
+GPU_PROFILES = {
+    "5090": {   # 32 GB — blobs in system RAM, never --data_device cuda
+        "gpu_name": "RTX_5090",
+        "max_dph": 0.38,
+        "train_frag": "--batch_size 256 --lr 7.5e-4 --checkpoint_rounds 3 "
+                      "--data ram --compile_mode default",
+    },
+    "6000": {   # RTX PRO 6000 Blackwell WS, 96 GB — the proven recipe
+        "gpu_name": "RTX_PRO_6000_WS",
+        "max_dph": 1.2,
+        "train_frag": "--batch_size 1024 --lr 3e-3 --checkpoint_rounds 3 "
+                      "--data ram --data_device cuda --compile_mode default",
+    },
+    "b200": {   # 180 GB — no checkpointing needed; market floor may sit
+                # above the cap, so expect to bump --max-dph explicitly
+        "gpu_name": "B200",
+        "max_dph": 8.0,
+        "train_frag": "--batch_size 1024 --lr 3e-3 --checkpoint_rounds 0 "
+                      "--data ram --data_device cuda --compile_mode default",
+    },
+}
+BASE_TRAIN_ARGS = "--num_epochs 300 --artifact_every 25"
+
+
+def resolve_profile(args):
+    """(profile dict, gpu_name, max_dph) — CLI --gpu/--max-dph override."""
+    prof = GPU_PROFILES[args.profile]
+    gpu = args.gpu or prof["gpu_name"]
+    max_dph = args.max_dph if args.max_dph is not None else prof["max_dph"]
+    return prof, gpu, max_dph
+
 
 VASTAI = (shutil.which("vastai")
           or r"C:\Users\JmgLi\anaconda3\envs\ToastEnv\Scripts\vastai.exe")
@@ -189,11 +228,13 @@ def fmt_offer(o: dict) -> str:
 
 
 def cmd_search(args):
-    offers = search_offers(args.gpu, args.max_dph, args.inet)
+    prof, gpu, max_dph = resolve_profile(args)
+    offers = search_offers(gpu, max_dph, args.inet)
     if not offers:
         print("No offers matched â€” relax --max-dph or --inet.")
         return
-    print(f"Top {len(offers)} offers for {args.gpu}:")
+    print(f"Top {len(offers)} offers for {gpu} (profile {args.profile}, "
+          f"cap ${max_dph}/hr):")
     for o in offers:
         print(fmt_offer(o))
 
@@ -273,15 +314,20 @@ def create_instance(offer_id: int, secrets: dict, branch: str,
 
 def cmd_launch(args):
     secrets = load_secrets()
+    prof, gpu, max_dph = resolve_profile(args)
+    if args.train_args is None:
+        args.train_args = f"{BASE_TRAIN_ARGS} {prof['train_frag']}"
     if args.smoke:
         args.train_args = ("--num_epochs 1 --batch_size 256 "
                            "--data ram --compile_mode default "
                            "--run_name smoke_test")
         args.keep_alive = True
+    print(f"Profile {args.profile} ({gpu}, cap ${max_dph}/hr)")
+    print(f"  train args: {args.train_args}")
 
     offer_id = args.offer
     if offer_id is None:
-        offers = search_offers(args.gpu, args.max_dph, args.inet)
+        offers = search_offers(gpu, max_dph, args.inet)
         offer = pick_offer(offers)
         if offer is None:
             sys.exit("No offers matched the filters.")
@@ -324,7 +370,8 @@ def extract_marker_json(logs: str, marker: str = "BENCHMARK_JSON "):
 
 def cmd_scan(args):
     secrets = load_secrets()
-    offers = search_offers(args.gpu, args.max_dph, args.inet, limit=40)
+    prof, gpu, max_dph = resolve_profile(args)
+    offers = search_offers(gpu, max_dph, args.inet, limit=40)
     if len(offers) < args.n:
         sys.exit(f"Only {len(offers)} offers matched; need {args.n}.")
 
@@ -500,11 +547,16 @@ def main():
     sub = p.add_subparsers(dest="cmd", required=True)
 
     def common(sp):
-        # USER DIRECTIVE 2026-07-17: single RTX 5090 is the default class
-        # (burn-rate cut; 32 GB is enough at batch 256). RTX_PRO_6000_WS /
-        # B200 only when the user explicitly asks for a fast run.
-        sp.add_argument("--gpu",     type=str,   default="RTX_5090")
-        sp.add_argument("--max-dph", type=float, default=0.6, dest="max_dph")
+        # USER DIRECTIVE 2026-07-17: profiles. 5090 is the workhorse
+        # (overnight runs); --profile 6000 / b200 for user-requested fast
+        # same-day runs. Each profile sets gpu_name, price cap, and the
+        # training recipe; --gpu / --max-dph override the first two.
+        sp.add_argument("--profile", type=str, default="5090",
+                        choices=sorted(GPU_PROFILES))
+        sp.add_argument("--gpu",     type=str,   default=None,
+                        help="override the profile's Vast gpu_name")
+        sp.add_argument("--max-dph", type=float, default=None, dest="max_dph",
+                        help="override the profile's price cap")
         sp.add_argument("--inet",    type=int,   default=500)
         sp.add_argument("--branch",  type=str,   default="master")
 
@@ -512,16 +564,11 @@ def main():
 
     sp = sub.add_parser("launch");  common(sp)
     sp.add_argument("--offer",      type=int, default=None)
-    # Default recipe = the single-5090 profile (32 GB): batch 256 with lr
-    # linearly rescaled from the 1024/3e-3 recipe, data blobs in system RAM
-    # (dataset does not fit in VRAM), compile default (max-autotune measured
-    # ~nil and its private pools eat headroom), ck3 partial checkpointing
-    # (~15 GB for loop-R7; ignored by non-loop archs).
     sp.add_argument("--train-args", type=str, dest="train_args",
-                    default="--num_epochs 300 --artifact_every 25 "
-                            "--batch_size 256 --lr 7.5e-4 "
-                            "--checkpoint_rounds 3 --data ram "
-                            "--compile_mode default")
+                    default=None,
+                    help="Full replacement for the profile's default "
+                         "train args (BASE_TRAIN_ARGS + the profile's "
+                         "batch/lr/data/compile recipe)")
     sp.add_argument("--train-script", type=str, dest="train_script",
                     default="train_neocore.py",
                     help="Training entry point; default is the Neocore "
