@@ -32,8 +32,12 @@ bit-identical; do not mix pipelines within a comparison series):
 
 import json
 import math
+import os
 import queue
+import shutil
+import subprocess
 import threading
+import time
 from pathlib import Path
 
 import torch
@@ -95,12 +99,82 @@ def _build_split_blob(jpeg_split_dir: Path, out_file: Path, batch: int = 512):
           f"{images.numel() / 1e9:.1f} GB")
 
 
+# ---------------------------------------------------------------------------
+# Dataset bank: pull prebuilt blobs at boot instead of the HF -> jpeg cache
+# -> blob-build dance (~15 min and two external dependencies saved per boot).
+# Backend chosen by RAM_BANK env: "wandb" (default; creds already on every
+# instance), "gdrive" (rclone; dormant until RCLONE_DRIVE_TOKEN is set in
+# secrets.env), "none" (skip — always build locally).
+# Upload side: vast/upload_blobs.py, run once on an instance holding blobs.
+# ---------------------------------------------------------------------------
+
+BANK_REF_DEFAULT = "luckymushy-individual/neocore/imagenet100-ram256:latest"
+
+
+def _bank_pull_wandb(blob_dir: Path) -> bool:
+    import wandb
+    ref = os.environ.get("RAM_BANK_REF", BANK_REF_DEFAULT)
+    for attempt in range(8):    # patient, but not build-blockingly so
+        try:
+            art = wandb.Api().artifact(ref, type="dataset")
+            art.download(root=str(blob_dir))
+            print(f"[bank] pulled {ref} -> {blob_dir}")
+            return True
+        except Exception as e:
+            msg = str(e).lower()
+            if "not found" in msg or "does not exist" in msg:
+                print(f"[bank] artifact {ref} not published yet — will build")
+                return False
+            wait = min(300, 60 * (attempt + 1))
+            print(f"[bank] wandb pull failed ({e!r}) — "
+                  f"retry {attempt + 1}/7 in {wait}s")
+            time.sleep(wait)
+    return False
+
+
+def _bank_pull_gdrive(blob_dir: Path) -> bool:
+    """rclone pull from Drive. Requires RCLONE_DRIVE_TOKEN (the JSON from
+    `rclone authorize "drive"`) in the environment; remote path override
+    via RAM_BANK_DRIVE_PATH. UNTESTED until the token exists."""
+    token = os.environ.get("RCLONE_DRIVE_TOKEN")
+    if not token:
+        print("[bank] RCLONE_DRIVE_TOKEN not set — skipping gdrive")
+        return False
+    if shutil.which("rclone") is None:
+        subprocess.run("curl -fsSL https://rclone.org/install.sh | bash",
+                       shell=True, check=False)
+        if shutil.which("rclone") is None:
+            print("[bank] rclone install failed")
+            return False
+    conf = Path.home() / ".config" / "rclone" / "rclone.conf"
+    conf.parent.mkdir(parents=True, exist_ok=True)
+    conf.write_text(f"[gdrive]\ntype = drive\nscope = drive\n"
+                    f"token = {token}\n")
+    src = os.environ.get("RAM_BANK_DRIVE_PATH", "gdrive:NeocoreBank/ram256")
+    r = subprocess.run(["rclone", "copy", src, str(blob_dir),
+                        "--transfers", "4", "--retries", "8",
+                        "--low-level-retries", "20"], check=False)
+    return r.returncode == 0
+
+
+def _bank_pull(blob_dir: Path) -> bool:
+    kind = os.environ.get("RAM_BANK", "wandb")
+    if kind == "none":
+        return False
+    blob_dir.mkdir(parents=True, exist_ok=True)
+    return _bank_pull_gdrive(blob_dir) if kind == "gdrive" \
+        else _bank_pull_wandb(blob_dir)
+
+
 def ensure_ram_cache(cfg) -> tuple[Path, Path]:
-    """Return (train_blob, val_blob), building anything missing."""
+    """Return (train_blob, val_blob): local hit -> bank pull -> full build."""
     root = Path(cfg.jpeg_cache_dir)
     blob_dir = root / "ram256"
     train_blob = blob_dir / "train.pt"
     val_blob   = blob_dir / "validation.pt"
+
+    if not (train_blob.exists() and val_blob.exists()):
+        _bank_pull(blob_dir)
 
     if not (train_blob.exists() and val_blob.exists()):
         # jpeg cache is the build input — create it first if needed
