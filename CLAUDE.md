@@ -1,16 +1,24 @@
 # NeocoreImagenet
 
-ASFNet experiments on ImageNet-100 (`clane9/imagenet-100`, auto-downloaded
-from HuggingFace on first run; DALI dataloading via a one-time JPEG cache).
+Neocore (formerly ASFNet — old naming retired) experiments on ImageNet-100
+(`clane9/imagenet-100`, auto-downloaded from HuggingFace on first run; DALI
+dataloading via a one-time JPEG cache, or the RAM-resident blob cache).
 
-- `train_asfnet*.py` / `model_asfnet*.py` — classification variants
-  (`_br` = border-retention, `2` = two-stage).
-- `*_ae` — self-supervised MAE-style autoencoder on the ASFNetBR backbone.
-  Current research direction. Eval/visualisation: `evaluate_asfnet_br.py --ae`
-  (reconstruction + retention panels); non-AE modes produce chunk-map grids.
-- `train_linear_probe.py` — frozen-backbone linear probe of an AE checkpoint
-  on ImageNet-100 (loads the checkpoint from a wandb artifact).
-- Training logs to wandb: project `asfnetAE` for AE runs, `asfnet` for probes.
+- `model_neocore.py` / `train_neocore.py` / `evaluate_neocore.py` — the
+  **current model**: recursive AR-admission autoencoder (see the 2026-07-17
+  checkpoint below). Eval renders admission-order maps + reconstructions +
+  per-round decodes.
+- `dataset_ram.py` — RAM-resident dataset (`--data ram`): decoded uint8
+  256×256 blobs built once via DALI, torch-only loader with GPU aug;
+  `--data_device cuda` keeps the whole dataset in VRAM. Val protocol exactly
+  equivalent to DALI val (numbers comparable).
+- `train_asfnet*.py` / `model_asfnet*.py` — legacy classification variants
+  (`_br` = border-retention, `2` = two-stage); `*_ae` — the MAE-style AE /
+  ladder era (eval: `evaluate_asfnet_br.py --ae`).
+- `train_linear_probe.py` — frozen-backbone linear/attentive probe of an AE
+  checkpoint (wandb artifact); supports both Neocore and legacy backbones.
+- wandb projects: `neocore` for Neocore AE runs, `asfnetAE` legacy AE,
+  `asfnet` for probes.
 
 ## Research checkpoint (2026-07-15) — where the AE work stands
 
@@ -173,6 +181,71 @@ each killed runs at boot — artifact/dataset I/O now retries with backoff;
 successful runs AWAIT PULL (`launch.py pull`, scp + account ssh key)
 instead of self-destroying; known-bad machines list grew (m48680 GPU hang,
 m140634 zombie boot).
+
+## Research checkpoint (2026-07-17 overnight) — Neocore: the loop exists and it helps
+
+Neocore built, validated, and R-swept in one night. Architecture
+(model_neocore.py): one weight-shared 8-block core (d=256, h=8, mlp 3.0)
+applied R rounds over the full 196-token 16×16 grid; each round a linear
+score head ranks not-yet-admitted tokens, exactly K/R are admitted (hard
+detached top-k — the only regime that has ever held), admitted tokens are
+stamped once with a confidence-gated residual + learned marker; features
+carry forward between rounds; MAE decoder (128×4) from the final K=49;
+dropped-only norm-pix loss. NO auxiliary losses — K and R are
+architectural constants (the law). 6.25M params. Nullity alarms logged
+every step: `overlap_r1` (final memory ∩ top-K-by-round-1-scores; 1.0 =
+collapsed to sorted one-shot) and `admit_corr`. Recipe = budget25's
+(batch 1024, lr 3e-3, wd 0.05, cosine 300 ep). `--checkpoint_rounds N`
+partial activation checkpointing (batch 1024 uncheckpointed OOMs at
+~90 GB; ck3 ≈ 62 GB and −14% epoch time vs full ckpt).
+
+1. **R-sweep (R ∈ {1,2,4,7}, K=49, 300 ep each; val rec dropped-only,
+   best/final):** R1 0.0989/0.1011 · R2 0.0987/0.0988 · R4 0.0955/0.0986 ·
+   R7 **0.0871**/0.0896. Recursion helps monotonically with GROWING
+   per-round returns (deltas 1→2 −0.0002, 2→4 −0.0032, 4→7 −0.0084); R7
+   is 12% relative better than R1 despite losing ~20 epochs to lr spikes.
+2. **R1 final 0.1011 replicates budget25's 0.101 to three decimals** —
+   at one shot the rate (49/196) fully determines rec; scorer mechanism
+   (learned head vs edge evidence) and encoder access are irrelevant.
+3. **The nullity corner did NOT occur**: R7 overlap_r1 fell to ~0.50 —
+   half the final memory differs from the one-shot ranking; the recursion
+   genuinely re-decides.
+4. **Anti-correlation prediction FALSIFIED, informatively.** Round-t+1
+   picks land at residual-error percentile 0.31–0.47 (< 0.5): the loop is
+   mildly error-AVOIDANT, not error-seeking. Reading: under dropped-only
+   loss, memory wants tokens that predict OTHERS; high-self-error patches
+   are unpredictable textures that summarize nothing. Admission maps
+   corroborate: rough spatial coverage early, late rounds on object
+   detail, flat/noisy texture avoided. No contiguous chunk regions.
+5. **Open confound (pre-registered, NOT yet separated): depth vs memory.**
+   7 weight-shared passes = deeper net regardless of admission quality.
+   Queued discriminator: R=7 with RANDOM admission order vs learned.
+6. **Trainability**: R7 hit two loss spikes at lr 3e-3 (ep 30, ep 41 →
+   0.78), both self-recovered under grad-clip 1.0; R2/R4 smooth. Deeper
+   recursion wants a gentler lr.
+7. **Probes (attentive, 180 ep, project `asfnet`)**: R1 memory-49
+   28.8% / all-196 35.5% top-1 (budget25 equivalents 26.5 / 32.0 — the
+   Neocore encoder is better even one-shot). The memory-vs-all gap
+   (6.7 pt at R1) is the number recursion must shrink for the
+   "admission concentrates class signal" story. R7 mem/all + R2 mem
+   probes in flight at time of writing.
+8. **Compute-bound correction**: the "85% data-wait" metric was an
+   async-CUDA accounting artifact (CPU blocks at the iterator sync point;
+   GPU drain lands there). Proof: RAM loader and DALI produce identical
+   81 s epochs; nvidia-smi 100%/550 W during epochs. Neocore is
+   compute-bound at ~25% MFU; 80 s/epoch is the floor at this size.
+   Speed levers left are architectural, not plumbing. (max-autotune ≈
+   nil, fused AdamW ≈ nil; the real win was checkpoint_rounds.)
+9. **RAM blob cache built + validated** (dataset_ram.py): train 24.9 GB /
+   val 1.0 GB uint8 blobs; both cpu and VRAM-resident modes work. Blobs
+   live on STOPPED sandbox instance 45137008 (keep stopped, do not
+   destroy — the disk holds them). Morning task WITH the user: wire a
+   Google Drive (or wandb/HF) dataset bank around these blobs — the
+   train blob exceeds Drive's free 15 GB, needs a user decision.
+
+Checkpoints/panels in runs/NC_R{1,2,4,7}_K49_300ep/; wandb artifacts
+neocore-{i0tqyho2,2wa5npcb,3p04yekp,ab1e8nam}:final. Sweep figure:
+runs/night_analysis.png. Full night narrative in POINTS_OF_INTEREST.md.
 
 ## Local environment (Windows)
 
