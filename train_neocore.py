@@ -189,10 +189,15 @@ def main():
     parser.add_argument("--grad_clip",     type=float, default=1.0)
     parser.add_argument("--warmup_epochs", type=int,   default=10)
     parser.add_argument("--no_round_checkpoint", action="store_true",
-                        help="Disable per-round gradient checkpointing. "
-                             "Without it, R=7 x 8 blocks stores ~60 GB of "
-                             "activations at batch 1024 — only turn this "
-                             "off with small batches or huge cards.")
+                        help="Disable per-round gradient checkpointing and "
+                             "skip its ~25%% recompute. R=7 x 8 blocks "
+                             "stores ~70 GB of activations at batch 1024 — "
+                             "fits the 96 GB fleet cards; keep checkpointing "
+                             "for batch 2048+ or smaller cards.")
+    parser.add_argument("--compile_mode", type=str, default="max-autotune",
+                        help="torch.compile mode. max-autotune costs a few "
+                             "extra minutes at boot, worth it over a full "
+                             "run; use 'default' if autotune misbehaves.")
 
     # --- Data ---
     parser.add_argument("--dataset_name",      type=str, default="clane9/imagenet-100")
@@ -259,7 +264,7 @@ def main():
     train_loader, val_loader = get_dataloaders(args)
 
     model = build_model(args).to(device)
-    model = torch.compile(model)
+    model = torch.compile(model, mode=args.compile_mode)
 
     param_counts = model.count_parameters()
     print("\nParameter counts:")
@@ -269,8 +274,10 @@ def main():
           f"(K={args.memory_tokens} over R={args.rounds} rounds)")
     wandb.config.update({"param_counts": param_counts})
 
+    # fused AdamW: same math, one kernel — a few % on a model this small
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr,
-                                  weight_decay=args.weight_decay)
+                                  weight_decay=args.weight_decay,
+                                  fused=(device.type == "cuda"))
     warmup_sched = torch.optim.lr_scheduler.LinearLR(
         optimizer, start_factor=1e-6, end_factor=1.0, total_iters=args.warmup_epochs)
     cosine_sched = torch.optim.lr_scheduler.CosineAnnealingLR(
