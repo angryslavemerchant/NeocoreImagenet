@@ -56,8 +56,8 @@ def build_model(args) -> NeocoreAE:
         decoder_d_model  = args.decoder_d_model,
         decoder_blocks   = args.decoder_blocks,
         decoder_heads    = args.decoder_heads,
-        norm_pix_loss    = not args.no_norm_pix,
-        round_checkpoint = not args.no_round_checkpoint,
+        norm_pix_loss     = not args.no_norm_pix,
+        checkpoint_rounds = args.checkpoint_rounds,
     )
 
 
@@ -188,12 +188,12 @@ def main():
     parser.add_argument("--weight_decay",  type=float, default=0.05)
     parser.add_argument("--grad_clip",     type=float, default=1.0)
     parser.add_argument("--warmup_epochs", type=int,   default=10)
-    parser.add_argument("--no_round_checkpoint", action="store_true",
-                        help="Disable per-round gradient checkpointing and "
-                             "skip its ~25%% recompute. R=7 x 8 blocks "
-                             "stores ~70 GB of activations at batch 1024 — "
-                             "fits the 96 GB fleet cards; keep checkpointing "
-                             "for batch 2048+ or smaller cards.")
+    parser.add_argument("--checkpoint_rounds", type=int, default=-1,
+                        help="Gradient-checkpoint the first N rounds "
+                             "(-1 = all, 0 = none). Measured at batch 1024 "
+                             "on 96 GB: all ~21 GB (+33%% recompute), "
+                             "0 OOMs (~90 GB), 3 ~57 GB (+14%% recompute) — "
+                             "the speed/memory dial.")
     parser.add_argument("--compile_mode", type=str, default="max-autotune",
                         help="torch.compile mode. max-autotune costs a few "
                              "extra minutes at boot, worth it over a full "

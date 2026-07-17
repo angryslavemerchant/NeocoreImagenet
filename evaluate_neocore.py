@@ -51,8 +51,8 @@ def load_model(path: str, device: torch.device):
         decoder_d_model  = a["decoder_d_model"],
         decoder_blocks   = a["decoder_blocks"],
         decoder_heads    = a["decoder_heads"],
-        norm_pix_loss    = not a.get("no_norm_pix", False),
-        round_checkpoint = False,   # eval: no grads, no checkpointing
+        norm_pix_loss     = not a.get("no_norm_pix", False),
+        checkpoint_rounds = 0,   # eval: no grads, no checkpointing
     )
     state_dict = {k.replace("_orig_mod.", "", 1): v
                   for k, v in ckpt["model"].items()}

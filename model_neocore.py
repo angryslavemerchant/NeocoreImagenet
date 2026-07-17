@@ -68,7 +68,7 @@ class NeocoreAE(nn.Module):
         decoder_blocks:   int   = 4,
         decoder_heads:    int   = 4,
         norm_pix_loss:    bool  = True,
-        round_checkpoint: bool  = True,
+        checkpoint_rounds: int  = -1,
     ):
         super().__init__()
         assert (d_model // num_heads) % 4 == 0, \
@@ -83,7 +83,11 @@ class NeocoreAE(nn.Module):
         self.rounds        = rounds
         self.memory_tokens = memory_tokens
         self.norm_pix_loss = norm_pix_loss
-        self.round_checkpoint = round_checkpoint
+        # Gradient-checkpoint the first N rounds (-1 = all, 0 = none).
+        # Measured at batch 1024 on 96 GB: all-7 ≈ 21 GB but pays ~33%
+        # recompute; none needs ~90 GB (OOM'd 2026-07-17); first-3 ≈ 57 GB
+        # and pays recompute on only 3/7 of the core.
+        self.checkpoint_rounds = checkpoint_rounds
 
         assert 1 <= rounds <= memory_tokens <= self.n_patches
 
@@ -172,8 +176,9 @@ class NeocoreAE(nn.Module):
         trace = [] if collect_trace else None
 
         for r in range(self.rounds):
-            if self.round_checkpoint and self.training \
-                    and torch.is_grad_enabled():
+            ckpt_this = (self.checkpoint_rounds < 0
+                         or r < self.checkpoint_rounds)
+            if ckpt_this and self.training and torch.is_grad_enabled():
                 tok = checkpoint(self._core_pass, tok, coords,
                                  use_reentrant=False)
             else:
