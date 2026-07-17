@@ -92,7 +92,13 @@ def upload_jpeg_cache(root: Path) -> None:
         tf.add(root / "validation", arcname="validation")
     size = tar_path.stat().st_size
     print(f"[bank] uploading {size / 2**30:.2f} GiB to {BANK_REMOTE} ...")
+    # 256M chunks: Drive uploads with rclone's default 8 MiB chunks crawl
+    # (measured 2026-07-17: 2.35 GiB not done after 15 min on a 32 MiB/s
+    # uplink); large chunks fix it. Periodic one-line stats keep the tee'd
+    # log honest about progress.
     subprocess.run(["rclone", "copy", str(tar_path), BANK_REMOTE,
+                    "--drive-chunk-size", "256M",
+                    "--stats", "15s", "--stats-one-line", "-v",
                     *_RCLONE_RETRIES], check=True)
     out = subprocess.run(["rclone", "lsl", f"{BANK_REMOTE}/{BANK_TAR}"],
                          capture_output=True, text=True, check=True)
