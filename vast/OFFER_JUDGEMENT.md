@@ -58,6 +58,14 @@ below, then `launch.py launch --offer <ID>`.
   dropping a contract on 2026-07-15 — that instance was actually STOPPED
   MANUALLY BY THE USER; the machine is fine. Good second choice.
 
+## Machines with a caution flag (usable, watch them)
+
+- machine 137683 — Ryzen 9 9950X3D, Germany. Excellent performer (402
+  TFLOPS, ran two clean speed tests 2026-07-17), but ONCE spontaneously
+  stopped a fresh container ~2 min after boot (intended_status=stopped,
+  no error; not user-initiated). `vastai start instance <id>` revived it
+  and the run completed normally. If it stops twice, blacklist it.
+
 ## Known-bad machines (add as found; also `.vast/blacklist.json`)
 
 - machine 12092 — Core Ultra 9 285K, Nevada. Instance never booted (no

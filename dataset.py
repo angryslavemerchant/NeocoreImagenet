@@ -198,6 +198,9 @@ def get_dataloaders(cfg: Config) -> tuple[DALILoader, DALILoader]:
 
     root = Path(cfg.jpeg_cache_dir)
 
+    # prefetch_queue_depth 4 (DALI default 2): once the model outruns the
+    # loader (Neocore ck3 hit data_wait 85% at depth 2), a deeper queue
+    # lets decode run further ahead. Costs a little extra GPU memory only.
     train_pipe = _imagenet_pipeline(
         data_dir=str(root / "train"),
         crop_size=cfg.image_size,
@@ -206,6 +209,7 @@ def get_dataloaders(cfg: Config) -> tuple[DALILoader, DALILoader]:
         num_threads=cfg.num_workers,
         device_id=0,
         seed=cfg.seed,
+        prefetch_queue_depth=4,
     )
     val_pipe = _imagenet_pipeline(
         data_dir=str(root / "validation"),
@@ -215,6 +219,7 @@ def get_dataloaders(cfg: Config) -> tuple[DALILoader, DALILoader]:
         num_threads=cfg.num_workers,
         device_id=0,
         seed=cfg.seed,
+        prefetch_queue_depth=4,
     )
 
     train_pipe.build()
