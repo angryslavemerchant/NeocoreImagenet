@@ -15,6 +15,19 @@ cd "$(dirname "$0")/.."
 export PYTHONUNBUFFERED=1
 export DEBIAN_FRONTEND=noninteractive
 
+# Caches OUTSIDE the repo: the provision command `rm -rf`s the repo on
+# every (re)start, and a stop/start on 2026-07-17 wiped the ram256 blobs
+# that lived in ./jpeg_cache. Symlink the cache dirs into /workspace so
+# restarts on the same machine keep them (the dataset bank remains the
+# real cross-machine persistence).
+for d in jpeg_cache data; do
+    mkdir -p "/workspace/${d}"
+    if [ ! -L "${d}" ]; then
+        rm -rf "${d}"
+        ln -s "/workspace/${d}" "${d}"
+    fi
+done
+
 INSTANCE_ID="${VAST_CONTAINERLABEL#C.}"
 echo "ONSTART_BEGIN instance=${INSTANCE_ID} $(date -u +%FT%TZ)"
 
