@@ -131,6 +131,43 @@ rec numbers are NOT comparable across conventions.
     (differentiable superpixels) rather than cut fields; probe of
     compfloor when done; distillation/JEPA objective.
 
+## Research checkpoint (2026-07-16 night) — ladder era closes; loop era opens
+
+Final ladder results (4x4, 300 ep, rec on dropped @ 49-token rate unless
+noted; all weights/panels in runs/<name>/):
+
+1. **AEL_compfloor_4px: 0.270 — the project's best AE.** Component borders
+   + exact-K floor. Stage-2 router grew to ~86 REAL separating cuts by the
+   end (the floor un-froze it); stage 3 stayed islands+evidence-fill.
+2. **AEL_ghost_4px (finishing overnight, ~0.30): the decisive negative.**
+   Ghost grid fixed every mechanical grievance — dropped tokens persist as
+   frozen ghosts, all 6160 edges routable at every stage, zero islands
+   possible, resurrection allowed, ALL THREE routers demonstrably cutting
+   (~4k edges each) — and the stages still produce the SAME-density cut
+   fields. No coarsening across stages. Mechanics were never the blocker:
+   a one-shot knowledge-free router cannot parse, no matter how healthy.
+3. **AEL_pureborder_4px (killed ep ~55, batch-512/LR instability): the
+   accidental positive.** Its stage-1 borders coarsened across TRAINING
+   TIME (2789 -> 2081) while never coarsening across stages. Coarsening
+   lives where knowledge accumulates (weights over epochs), not where it
+   doesn't (depth within a pass).
+4. **Synthesis (see POINTS_OF_INTEREST.md, local/gitignored — read it
+   after this file): chunking is a POSTCONDITION of recognition.** The
+   degeneracy zoo was SGD correctly reporting that stage-0 knowledge-free
+   chunking has no solution. The evidence votes admission-control over
+   parse-tree: every rec gain this week came from shedding region
+   machinery (evidence rank + exact-K), every failure from demanding it.
+5. **Next experiment (decided): recursive single-stage AR admission.**
+   No ladder, no cuts, no borders. One weight-shared encoder applied
+   recursively: each round scores tokens, admits K/R more (exact-K per
+   round — the only regime that has ever held), marks admitted tokens
+   with one learned "in-memory" embedding, re-encodes. R=1 == current
+   budget model (built-in control). Reconstruction teaches; the attentive
+   probe measures; ADMISSION-ORDER MAPS are the new instrument (color by
+   round — watch where it looks once it knows what it has). Prediction to
+   test: round-t admissions anti-correlate with what rounds <t already
+   reconstruct.
+
 Cloud lessons (2026-07-15/16): wandb GCS 403 outage (~1 h) and an HF 502
 each killed runs at boot — artifact/dataset I/O now retries with backoff;
 successful runs AWAIT PULL (`launch.py pull`, scp + account ssh key)
