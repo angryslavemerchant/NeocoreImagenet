@@ -23,6 +23,15 @@ K and R are architectural constants; the only learnable degrees of
 freedom are WHICH tokens enter and in WHAT ORDER. R=1 collapses to the
 one-shot budget model (AE_budget25, val rec 0.101), the built-in control.
 
+RESELECT MODE (2026-07-17 ablation, user-requested): with reselect=True
+the full K are re-picked from scratch every round — no accumulation, no
+sticky membership; the final round's selection meets the decoder and the
+marker (re-stamped per round) means "currently in memory". This is R
+passes of weight-shared depth WITHOUT incremental memory — one arm of
+the depth-vs-memory discriminator. Its alarm is `stability` (mean
+consecutive-round selection overlap): 1.0 = the selection froze after
+round 1 and the variant is a deep one-shot.
+
 The pre-registered failure mode is NULLITY, not collapse: the score head
 could ignore the markers and reproduce the one-shot ranking in R slices.
 forward() therefore returns two alarms computed every step:
@@ -64,6 +73,7 @@ class NeocoreAE(nn.Module):
         mlp_ratio:        float = 3.0,
         rounds:           int   = 7,
         memory_tokens:    int   = 49,
+        reselect:         bool  = False,
         decoder_d_model:  int   = 128,
         decoder_blocks:   int   = 4,
         decoder_heads:    int   = 4,
@@ -82,6 +92,15 @@ class NeocoreAE(nn.Module):
         self.n_patches     = self.grid_size ** 2
         self.rounds        = rounds
         self.memory_tokens = memory_tokens
+        # reselect: every round the score head picks the FULL K from
+        # scratch over all tokens — membership is not sticky, nothing
+        # accumulates, the final round's selection meets the decoder.
+        # The marker then means "currently in memory" and is re-stamped
+        # each round on the current selection (in accumulate mode it is
+        # stamped once, at admission). Ablation value: R passes of
+        # weight-shared depth WITHOUT incremental memory — one arm of
+        # the depth-vs-memory discriminator.
+        self.reselect      = reselect
         self.norm_pix_loss = norm_pix_loss
         # Gradient-checkpoint the first N rounds (-1 = all, 0 = none).
         # Measured at batch 1024 on 96 GB: all-7 ≈ 21 GB but pays ~33%
@@ -89,13 +108,17 @@ class NeocoreAE(nn.Module):
         # and pays recompute on only 3/7 of the core.
         self.checkpoint_rounds = checkpoint_rounds
 
-        assert 1 <= rounds <= memory_tokens <= self.n_patches
-
-        # Exact-K per round — the only regime that has ever held. Any
-        # remainder of K/R goes to the earliest rounds.
-        base, rem = divmod(memory_tokens, rounds)
-        self.admit_schedule = [base + (1 if r < rem else 0)
-                               for r in range(rounds)]
+        if reselect:
+            assert 1 <= rounds and memory_tokens <= self.n_patches
+            # Full K picked fresh every round; schedule kept for printouts.
+            self.admit_schedule = [memory_tokens] * rounds
+        else:
+            assert 1 <= rounds <= memory_tokens <= self.n_patches
+            # Exact-K per round — the only regime that has ever held. Any
+            # remainder of K/R goes to the earliest rounds.
+            base, rem = divmod(memory_tokens, rounds)
+            self.admit_schedule = [base + (1 if r < rem else 0)
+                                   for r in range(rounds)]
 
         # ---- Core: weight-shared encoder applied every round ----
         self.patch_embed = PatchEmbed(image_size, patch_size,
@@ -160,8 +183,15 @@ class NeocoreAE(nn.Module):
         The loop. Returns:
             tok:          (B, N, D) final features (pre-norm)
             admitted:     (B, N) bool — exactly K True per image
-            admit_round:  (B, N) long — round each token entered (-1 = never)
+                          (reselect: the FINAL round's selection)
+            admit_round:  (B, N) long — round each token entered (-1 = never;
+                          reselect: FIRST round selected, even if later
+                          evicted — the maps then show churn history)
             first_scores: (B, N) detached round-1 scores (nullity alarms)
+            stability:    0-dim detached — mean consecutive-round selection
+                          overlap /K (reselect; 1.0 = selection frozen after
+                          round 1). Constant 1.0 in accumulate mode (memory
+                          never evicts by construction).
             trace:        list of (tok_after_round, admitted_after_round)
                           detached clones, one per round — only when
                           collect_trace (eval instrument), else None
@@ -173,6 +203,7 @@ class NeocoreAE(nn.Module):
         admit_round = torch.full((B, N), -1, dtype=torch.long,
                                  device=tok.device)
         first_scores = None
+        stab_sum = torch.zeros((), device=tok.device)
         trace = [] if collect_trace else None
 
         for r in range(self.rounds):
@@ -188,25 +219,54 @@ class NeocoreAE(nn.Module):
             if r == 0:
                 first_scores = scores.detach()
 
-            # Hard exact-K admission among the not-yet-admitted. Detached —
-            # placement learns through the confidence residual, not top-k.
-            cand = scores.detach().masked_fill(admitted, float("-inf"))
-            top  = cand.topk(self.admit_schedule[r], dim=1).indices
-            new  = torch.zeros_like(admitted)
-            new.scatter_(1, top, True)
+            if self.reselect:
+                # Full-K re-selection over ALL tokens — nothing is sticky.
+                top = scores.detach().topk(self.memory_tokens, dim=1).indices
+                sel = torch.zeros_like(admitted)
+                sel.scatter_(1, top, True)
 
-            # Admission stamp: amplify by confidence (the score head's
-            # gradient path) and add the in-memory marker — once per token.
-            gate = torch.sigmoid(scores).unsqueeze(-1)
-            tok  = tok + new.unsqueeze(-1) * (gate * tok + self.marker)
+                # Membership stamp, re-applied every round to the CURRENT
+                # selection (same confidence-residual gradient path). A
+                # token held all R rounds compounds ×(1+gate) per round —
+                # pre-LN blocks tolerate residual-scale growth, but watch
+                # feature norms if R gets large.
+                gate = torch.sigmoid(scores).unsqueeze(-1)
+                tok  = tok + sel.unsqueeze(-1) * (gate * tok + self.marker)
 
-            admitted    = admitted | new
-            admit_round = torch.where(new, torch.full_like(admit_round, r),
-                                      admit_round)
+                if r > 0:
+                    stab_sum = stab_sum + (sel & admitted).sum(dim=1) \
+                        .float().mean() / self.memory_tokens
+                admit_round = torch.where(sel & (admit_round < 0),
+                                          torch.full_like(admit_round, r),
+                                          admit_round)
+                admitted = sel
+            else:
+                # Hard exact-K admission among the not-yet-admitted.
+                # Detached — placement learns through the confidence
+                # residual, not top-k.
+                cand = scores.detach().masked_fill(admitted, float("-inf"))
+                top  = cand.topk(self.admit_schedule[r], dim=1).indices
+                new  = torch.zeros_like(admitted)
+                new.scatter_(1, top, True)
+
+                # Admission stamp: amplify by confidence (the score head's
+                # gradient path) and add the in-memory marker — once per token.
+                gate = torch.sigmoid(scores).unsqueeze(-1)
+                tok  = tok + new.unsqueeze(-1) * (gate * tok + self.marker)
+
+                admitted    = admitted | new
+                admit_round = torch.where(new,
+                                          torch.full_like(admit_round, r),
+                                          admit_round)
             if collect_trace:
                 trace.append((tok.detach().clone(), admitted.clone()))
 
-        return tok, admitted, admit_round, first_scores, trace
+        if self.reselect and self.rounds > 1:
+            stability = (stab_sum / (self.rounds - 1)).detach()
+        else:
+            stability = torch.ones((), device=tok.device)
+
+        return tok, admitted, admit_round, first_scores, stability, trace
 
     # ------------------------------------------------------------------
     def _decode(
@@ -262,9 +322,11 @@ class NeocoreAE(nn.Module):
                         (per-patch-normalised targets if norm_pix_loss)
             overlap_r1: 0-dim detached tensor — see _nullity_alarms
             admit_corr: 0-dim detached tensor — see _nullity_alarms
+            stability:  0-dim detached tensor — see forward_rounds
         No auxiliary losses: rates are architectural constants.
         """
-        tok, admitted, admit_round, first_scores, _ = self.forward_rounds(imgs)
+        tok, admitted, admit_round, first_scores, stability, _ = \
+            self.forward_rounds(imgs)
         pred = self._decode(tok, admitted)                  # (B, N, p*p*C)
 
         target = self.patchify(imgs)
@@ -279,7 +341,7 @@ class NeocoreAE(nn.Module):
 
         overlap, corr = self._nullity_alarms(
             first_scores, admitted, admit_round, self.memory_tokens)
-        return loss_rec, overlap, corr
+        return loss_rec, overlap, corr, stability
 
     # ------------------------------------------------------------------
     def forward_features(self, imgs: torch.Tensor):
@@ -287,7 +349,7 @@ class NeocoreAE(nn.Module):
         Probe interface: (feats, admitted, admit_round) with feats normed.
         The attentive probe decides what to pool over (memory only vs all).
         """
-        tok, admitted, admit_round, _, _ = self.forward_rounds(imgs)
+        tok, admitted, admit_round, _, _, _ = self.forward_rounds(imgs)
         return self.norm(tok), admitted, admit_round
 
     @torch.no_grad()
@@ -296,7 +358,7 @@ class NeocoreAE(nn.Module):
         Viz helper: (pred_imgs, admitted, admit_round). pred_imgs is in
         normalised-pixel space when norm_pix_loss (structure, not colour).
         """
-        tok, admitted, admit_round, _, _ = self.forward_rounds(imgs)
+        tok, admitted, admit_round, _, _, _ = self.forward_rounds(imgs)
         pred = self._decode(tok, admitted)
         return self.unpatchify(pred.float()), admitted, admit_round
 
@@ -311,7 +373,7 @@ class NeocoreAE(nn.Module):
         round decodes are off-distribution — use the error maps' spatial
         RANKING, not their absolute values.
         """
-        tok, admitted, admit_round, _, trace = self.forward_rounds(
+        tok, admitted, admit_round, _, _, trace = self.forward_rounds(
             imgs, collect_trace=True)
         preds  = [self._decode(t, a) for t, a in trace]
         admits = [a for _, a in trace]

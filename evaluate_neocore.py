@@ -48,6 +48,7 @@ def load_model(path: str, device: torch.device):
         mlp_ratio        = a["mlp_ratio"],
         rounds           = a["rounds"],
         memory_tokens    = a["memory_tokens"],
+        reselect         = a.get("reselect", False),
         decoder_d_model  = a["decoder_d_model"],
         decoder_blocks   = a["decoder_blocks"],
         decoder_heads    = a["decoder_heads"],

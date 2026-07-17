@@ -52,6 +52,7 @@ def build_model(args) -> NeocoreAE:
         mlp_ratio        = args.mlp_ratio,
         rounds           = args.rounds,
         memory_tokens    = args.memory_tokens,
+        reselect         = args.reselect,
         decoder_d_model  = args.decoder_d_model,
         decoder_blocks   = args.decoder_blocks,
         decoder_heads    = args.decoder_heads,
@@ -85,6 +86,7 @@ def run_epoch(model, loader, optimizer, args, epoch, device,
     rec_losses = AverageMeter()
     overlaps   = AverageMeter()
     corrs      = AverageMeter()
+    stabs      = AverageMeter()   # reselect only; constant 1.0 otherwise
 
     tag  = "train" if train else "val"
     pbar = tqdm(loader, desc=f"Epoch {epoch+1}/{args.num_epochs} [{tag}]", leave=False)
@@ -103,7 +105,7 @@ def run_epoch(model, loader, optimizer, args, epoch, device,
             B = images.size(0)
 
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                loss_rec, overlap_r1, admit_corr = model(images)
+                loss_rec, overlap_r1, admit_corr, stability = model(images)
 
             if train:
                 optimizer.zero_grad()
@@ -114,6 +116,7 @@ def run_epoch(model, loader, optimizer, args, epoch, device,
             rec_losses.update(loss_rec.detach(), B)
             overlaps.update(overlap_r1, B)
             corrs.update(admit_corr, B)
+            stabs.update(stability, B)
             n_images      += B
             step_in_epoch += 1
 
@@ -126,10 +129,11 @@ def run_epoch(model, loader, optimizer, args, epoch, device,
                 images_seen += B
                 if images_seen // args.log_interval != prev_images // args.log_interval:
                     wandb.log({
-                        "train/rec_loss":    float(rec_losses.avg),
-                        "train/overlap_r1":  float(overlaps.avg),
-                        "train/admit_corr":  float(corrs.avg),
-                        "train/images_seen": images_seen,
+                        "train/rec_loss":      float(rec_losses.avg),
+                        "train/overlap_r1":    float(overlaps.avg),
+                        "train/admit_corr":    float(corrs.avg),
+                        "train/mem_stability": float(stabs.avg),
+                        "train/images_seen":   images_seen,
                     }, step=global_step)
                 global_step += 1
             t_iter = time.perf_counter()
@@ -148,9 +152,10 @@ def run_epoch(model, loader, optimizer, args, epoch, device,
 
     if not train:
         wandb.log({
-            "val/rec_loss":   float(rec_losses.avg),
-            "val/overlap_r1": float(overlaps.avg),
-            "val/admit_corr": float(corrs.avg),
+            "val/rec_loss":      float(rec_losses.avg),
+            "val/overlap_r1":    float(overlaps.avg),
+            "val/admit_corr":    float(corrs.avg),
+            "val/mem_stability": float(stabs.avg),
         }, step=global_step)
 
     return float(rec_losses.avg), global_step, images_seen, sys_stats
@@ -176,6 +181,12 @@ def main():
     parser.add_argument("--memory_tokens", type=int, default=49,
                         help="K tokens in working memory at the end; "
                              "K/R admitted per round, exact.")
+    parser.add_argument("--reselect", action="store_true",
+                        help="Re-pick the full K from scratch every round "
+                             "(no accumulation, no sticky membership; final "
+                             "round's selection meets the decoder). Logs "
+                             "mem_stability = consecutive-round selection "
+                             "overlap; 1.0 = frozen = deep one-shot.")
 
     # --- Decoder (MAE-style: narrower + shallower than the core) ---
     parser.add_argument("--decoder_d_model", type=int, default=128)
@@ -249,7 +260,8 @@ def main():
 
     if args.run_name is None:
         args.run_name = (f"NC_R{args.rounds}_K{args.memory_tokens}"
-                         f"_D{args.d_model}x{args.core_blocks}")
+                         f"_D{args.d_model}x{args.core_blocks}"
+                         + ("_resel" if args.reselect else ""))
 
     # Per-run local folder (system of record; wandb is logging only).
     # runs/LATEST points at it so vast/run_training.sh can find best.pt.
