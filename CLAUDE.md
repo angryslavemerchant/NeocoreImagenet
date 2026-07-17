@@ -244,16 +244,26 @@ partial activation checkpointing (batch 1024 uncheckpointed OOMs at
    nil, fused AdamW ≈ nil; the real win was checkpoint_rounds.)
 9. **RAM blob cache built + validated** (dataset_ram.py): train 24.9 GB /
    val 1.0 GB uint8 blobs; both cpu and VRAM-resident modes work.
-   **Dataset bank (2026-07-17 afternoon): ensure_ram_cache resolves
-   local → bank pull → full HF build.** Backend via RAM_BANK env:
-   `wandb` (default — artifact `imagenet100-ram256:latest`, publish once
-   with vast/upload_blobs.py) or `gdrive` (rclone; dormant until
-   RCLONE_DRIVE_TOKEN lands in secrets.env — needs user's OAuth click +
-   ≥26 GB Drive headroom). HARD LESSON: Vast stop→start re-runs the
-   provision command, which `rm -rf`s the repo — a restart WIPED the
-   blobs on sandbox 45137008 ("stop to preserve state" does not work).
-   onstart now symlinks jpeg_cache/ + data/ into /workspace so caches
-   survive same-machine restarts; the bank is the real persistence.
+   **Google Drive dataset bank (2026-07-17, DEPLOYED + smoke-proven):**
+   bank.py pulls the jpeg cache as ONE 2.35 GiB tar from
+   `gdrive:NeocoreBank/jpeg_cache.tar` (a dedicated storage Google
+   account, NOT the user's personal Drive; rclone OAuth token =
+   RCLONE_DRIVE_TOKEN in secrets.env, forwarded to instances base64 as
+   RCLONE_DRIVE_TOKEN_B64). Boot flow in dataset._ensure_cache: local →
+   bank → HF build; the 25 GB blob rebuilds locally from the jpegs
+   (source images are shorter-side-160 — the jpegs ARE the information;
+   the 256 cache upscales). Proven on a virgin instance: pull+extract
+   done at +133 s from boot, RUN_COMPLETE at +10m45 for a 1-epoch smoke
+   (old HF path: 15+ min to data-ready). Publish/refresh with
+   vast/upload_bank.py (256M drive chunks — default 8M chunks stall).
+   HARD LESSONS: (a) Vast stop→start re-runs the provision command,
+   which `rm -rf`s the repo — a restart WIPED the blobs on the sandbox
+   ("stop to preserve state" does not work); onstart now symlinks
+   jpeg_cache/ + data/ into /workspace so caches survive same-machine
+   restarts. (b) wandb-artifact bank was built then removed same day —
+   user is on wandb free plan, didn't want dataset storage there.
+   (c) The bank does NOT speed epochs (compute-bound, see item 8) —
+   it buys boot time and independence from HF/wandb availability.
 
 Checkpoints/panels in runs/NC_R{1,2,4,7}_K49_300ep/; wandb artifacts
 neocore-{i0tqyho2,2wa5npcb,3p04yekp,ab1e8nam}:final. Sweep figure:
