@@ -38,7 +38,10 @@ def main():
         print(f"Logged {len(pngs)} eval image(s)")
 
     def build_artifact():
-        artifact = wandb.Artifact(f"asfnet-ae-{run.id}", type="model")
+        # Neocore runs live in the `neocore` project — brand their final
+        # artifact to match train_neocore.py's periodic ones.
+        prefix = "neocore" if run.project == "neocore" else "asfnet-ae"
+        artifact = wandb.Artifact(f"{prefix}-{run.id}", type="model")
         added = False
         for name in ("best.pt", "latest.pt"):
             path = os.path.join(args.ckpt_dir, name)

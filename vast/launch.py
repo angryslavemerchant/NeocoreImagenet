@@ -228,11 +228,15 @@ def build_onstart(branch: str, train_args: str, bench_only: bool,
 def create_instance(offer_id: int, secrets: dict, branch: str,
                     train_args: str, bench_only: bool, keep_alive: bool,
                     purpose: str, train_script: str = None) -> int:
+    # Neocore runs log to their own wandb project (new era, new project);
+    # everything else stays in asfnetAE. upload_results.py reads the same
+    # env var, so training and the post-eval upload always agree.
+    wandb_project = "neocore" if train_script == "train_neocore.py" else "asfnetAE"
     env = (f"{TEMPLATE_ENV} "
            f"-e WANDB_API_KEY={secrets['WANDB_API_KEY']} "
            f"-e HF_TOKEN={secrets['HF_TOKEN']} "
            f"-e VAST_API_KEY={secrets['VAST_API_KEY']} "
-           f"-e WANDB_PROJECT=asfnetAE")
+           f"-e WANDB_PROJECT={wandb_project}")
     onstart = build_onstart(branch, train_args, bench_only, keep_alive,
                             train_script)
     result = vast("create", "instance", offer_id,

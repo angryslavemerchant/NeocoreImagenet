@@ -37,12 +37,18 @@ fi
 # themselves and need no separate eval step. runs/LATEST is written by the
 # train script and points at runs/<run_name>/.
 UPLOAD_OK=1
-if [ "${TRAIN_SCRIPT}" = "train_asfnet_ae.py" ]; then
+if [ "${TRAIN_SCRIPT}" = "train_asfnet_ae.py" ] || [ "${TRAIN_SCRIPT}" = "train_neocore.py" ]; then
     RUN_DIR="$(cat runs/LATEST 2>/dev/null || echo checkpoints_asfnet_ae)"
     echo "EVAL_START run_dir=${RUN_DIR}"
-    "$PY" evaluate_asfnet_br.py --ae \
-        --checkpoint "${RUN_DIR}/best.pt" \
-        --output_dir "${RUN_DIR}/viz" || echo "EVAL_FAILED (continuing to upload)"
+    if [ "${TRAIN_SCRIPT}" = "train_neocore.py" ]; then
+        "$PY" evaluate_neocore.py \
+            --checkpoint "${RUN_DIR}/best.pt" \
+            --output_dir "${RUN_DIR}/viz" || echo "EVAL_FAILED (continuing to upload)"
+    else
+        "$PY" evaluate_asfnet_br.py --ae \
+            --checkpoint "${RUN_DIR}/best.pt" \
+            --output_dir "${RUN_DIR}/viz" || echo "EVAL_FAILED (continuing to upload)"
+    fi
 
     # upload_results VERIFIES the final artifact committed (art.wait()) and
     # exits non-zero otherwise — self-destroy below is gated on that, so a
