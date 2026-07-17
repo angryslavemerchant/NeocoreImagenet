@@ -286,7 +286,8 @@ def cmd_launch(args):
     print(f"\nInstance {iid} created.")
     print(f"  watch:   python vast/launch.py logs --id {iid}")
     print(f"  destroy: python vast/launch.py destroy --id {iid}")
-    print("  wandb:   project 'asfnetAE' â€” run appears once training starts")
+    project = "neocore" if args.train_script == "train_neocore.py" else "asfnetAE"
+    print(f"  wandb:   project '{project}' - run appears once training starts")
 
 
 # ---------------------------------------------------------------------------
