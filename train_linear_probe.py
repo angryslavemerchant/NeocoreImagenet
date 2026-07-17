@@ -47,6 +47,7 @@ from tqdm import tqdm
 from dataset import get_dataloaders
 from model_asfnet_br import ASFNetBR
 from model_asfnet_ae_ladder import ASFNetAELadder
+from model_neocore import NeocoreAE
 from utils import AverageMeter
 
 
@@ -97,6 +98,22 @@ class ProbeModel(nn.Module):
             p.requires_grad = False
 
     def forward(self, images: torch.Tensor) -> torch.Tensor:
+        if isinstance(self.backbone, NeocoreAE):
+            # Neocore: nothing is dropped during encoding, so the two probe
+            # sets are MEMORY (the K admitted tokens — what the bottleneck
+            # actually carries; the default) and ALL 196 tokens (--topk 0 —
+            # the encoder-as-ViT upper bound).
+            feats, admitted, _ = self.backbone.forward_features(images)
+            pad_mask = torch.zeros_like(admitted) if self.topk == 0 \
+                else ~admitted
+            if self.attn_pool is not None:
+                pooled = self.attn_pool(feats, pad_mask)
+            else:
+                real_mask = (~pad_mask).float()
+                pooled = (feats * real_mask.unsqueeze(-1)).sum(dim=1) \
+                    / real_mask.sum(dim=1, keepdim=True).clamp(min=1)
+            return self.head(pooled)
+
         if isinstance(self.backbone, ASFNetAELadder):
             # Ladder: pool the final (~<=49) survivors; the budget already
             # selected them, so no probe-side topk.
@@ -160,6 +177,32 @@ def load_backbone(args, device) -> tuple[ASFNetBR, dict]:
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
     a = ckpt["args"]
 
+    if "rounds" in a and "core_blocks" in a:
+        # Neocore checkpoint: the whole model is the backbone (decoder
+        # weights load too but the probe never calls them).
+        model = NeocoreAE(
+            image_size        = a["image_size"],
+            patch_size        = a["patch_size"],
+            d_model           = a["d_model"],
+            num_heads         = a["num_heads"],
+            core_blocks       = a["core_blocks"],
+            mlp_ratio         = a["mlp_ratio"],
+            rounds            = a["rounds"],
+            memory_tokens     = a["memory_tokens"],
+            decoder_d_model   = a["decoder_d_model"],
+            decoder_blocks    = a["decoder_blocks"],
+            decoder_heads     = a["decoder_heads"],
+            norm_pix_loss     = not a.get("no_norm_pix", False),
+            checkpoint_rounds = 0,     # probe: frozen, no grads
+        )
+        sd = {k.replace("_orig_mod.", "", 1): v for k, v in ckpt["model"].items()}
+        model.load_state_dict(sd, strict=True)
+        print(f"Loaded Neocore model from {ckpt_path} "
+              f"(AE epoch {ckpt['epoch'] + 1}, R={a['rounds']}, "
+              f"K={a['memory_tokens']}, {len(sd)} tensors)")
+        model.to(device)
+        return model, a
+
     if a.get("ladder", False):
         # Ladder AE: the whole model (minus decoder usage) is the backbone;
         # keys load 1:1, decoder weights included but unused by the probe.
@@ -212,9 +255,13 @@ def load_backbone(args, device) -> tuple[ASFNetBR, dict]:
 
 
 def resolve_topk(args, ae_args: dict) -> int:
-    """--topk unset → match the AE's keep_budget bottleneck; 0 → all."""
+    """--topk unset → match the AE's keep_budget bottleneck; 0 → all.
+    Neocore: unset → memory tokens (K); 0 → all 196 tokens; the value is
+    only a label there — ProbeModel uses the admitted mask, not a rank."""
     if args.topk is not None:
         return args.topk
+    if "memory_tokens" in ae_args:
+        return ae_args["memory_tokens"]
     keep_budget = ae_args.get("keep_budget", 0.0)
     if keep_budget <= 0:
         return 0
