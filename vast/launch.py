@@ -25,6 +25,7 @@ Examples:
 """
 
 import argparse
+import base64
 import json
 import re
 import shutil
@@ -237,6 +238,12 @@ def create_instance(offer_id: int, secrets: dict, branch: str,
            f"-e HF_TOKEN={secrets['HF_TOKEN']} "
            f"-e VAST_API_KEY={secrets['VAST_API_KEY']} "
            f"-e WANDB_PROJECT={wandb_project}")
+    if secrets.get("RCLONE_DRIVE_TOKEN"):
+        # Drive dataset bank (bank.py). Base64: the raw token is JSON and
+        # would be mangled by the docker-style --env string.
+        b64 = base64.b64encode(
+            secrets["RCLONE_DRIVE_TOKEN"].encode()).decode()
+        env += f" -e RCLONE_DRIVE_TOKEN_B64={b64}"
     onstart = build_onstart(branch, train_args, bench_only, keep_alive,
                             train_script)
     result = vast("create", "instance", offer_id,

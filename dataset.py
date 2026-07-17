@@ -65,6 +65,15 @@ def _ensure_cache(cfg: Config) -> tuple[int, int]:
     val_done   = (val_dir   / _DONE_FLAG).exists()
 
     if not (train_done and val_done):
+        # Fast path: pull the 2.2 GB jpeg tar from the Drive bank
+        # (bank.py; needs RCLONE_DRIVE_TOKEN). Falls through to the HF
+        # build when unconfigured/unpublished.
+        from bank import pull_jpeg_cache
+        pull_jpeg_cache(root)
+        train_done = (train_dir / _DONE_FLAG).exists()
+        val_done   = (val_dir   / _DONE_FLAG).exists()
+
+    if not (train_done and val_done):
         print(f"JPEG cache not found at {root}. Building (one-time cost) ...")
         # HF Hub throws transient 5xx (502 killed a cloud run at boot,
         # 2026-07-15) — retry with backoff before giving up.
