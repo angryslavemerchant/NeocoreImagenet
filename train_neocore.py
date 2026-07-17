@@ -31,6 +31,7 @@ import wandb
 from tqdm import tqdm
 
 from model_neocore import NeocoreAE
+from model_neocore_ar import NeocoreARAE
 from utils import AverageMeter
 
 
@@ -41,7 +42,25 @@ def set_seed(seed: int):
     torch.cuda.manual_seed_all(seed)
 
 
-def build_model(args) -> NeocoreAE:
+def build_model(args):
+    if args.arch == "ar":
+        # AR sibling: bidirectional encode once + one-at-a-time causal
+        # memory generation (KV-cached at eval, replay-trained). rounds /
+        # reselect / checkpoint_rounds do not apply.
+        return NeocoreARAE(
+            image_size      = args.image_size,
+            patch_size      = args.patch_size,
+            in_channels     = 3,
+            d_model         = args.d_model,
+            num_heads       = args.num_heads,
+            core_blocks     = args.core_blocks,
+            mlp_ratio       = args.mlp_ratio,
+            memory_tokens   = args.memory_tokens,
+            decoder_d_model = args.decoder_d_model,
+            decoder_blocks  = args.decoder_blocks,
+            decoder_heads   = args.decoder_heads,
+            norm_pix_loss   = not args.no_norm_pix,
+        )
     return NeocoreAE(
         image_size       = args.image_size,
         patch_size       = args.patch_size,
@@ -175,6 +194,13 @@ def main():
     parser.add_argument("--mlp_ratio",   type=float, default=3.0)
 
     # --- The loop (both architectural constants — the law) ---
+    parser.add_argument("--arch", type=str, default="loop",
+                        choices=["loop", "ar"],
+                        help="loop: recursive full-grid re-encoding "
+                             "(model_neocore). ar: encode once + one-at-a-"
+                             "time causal memory generation "
+                             "(model_neocore_ar); rounds/reselect/"
+                             "checkpoint_rounds are ignored.")
     parser.add_argument("--rounds", type=int, default=7,
                         help="R recursive passes of the shared core; "
                              "R=1 == the one-shot budget model (control).")
@@ -258,10 +284,17 @@ def main():
     torch.set_float32_matmul_precision("high")   # TF32 for the fp32 paths
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
 
+    if args.arch == "ar" and args.reselect:
+        parser.error("--reselect applies to the loop arch only")
+
     if args.run_name is None:
-        args.run_name = (f"NC_R{args.rounds}_K{args.memory_tokens}"
-                         f"_D{args.d_model}x{args.core_blocks}"
-                         + ("_resel" if args.reselect else ""))
+        if args.arch == "ar":
+            args.run_name = (f"NCAR_K{args.memory_tokens}"
+                             f"_D{args.d_model}x{args.core_blocks}")
+        else:
+            args.run_name = (f"NC_R{args.rounds}_K{args.memory_tokens}"
+                             f"_D{args.d_model}x{args.core_blocks}"
+                             + ("_resel" if args.reselect else ""))
 
     # Per-run local folder (system of record; wandb is logging only).
     # runs/LATEST points at it so vast/run_training.sh can find best.pt.
@@ -302,8 +335,11 @@ def main():
     print("\nParameter counts:")
     for name, count in param_counts.items():
         print(f"  {name:<16} {count:>10,}")
-    print(f"Admission schedule: {model.admit_schedule} "
-          f"(K={args.memory_tokens} over R={args.rounds} rounds)")
+    if hasattr(model, "admit_schedule"):
+        print(f"Admission schedule: {model.admit_schedule} "
+              f"(K={args.memory_tokens} over R={args.rounds} rounds)")
+    else:
+        print(f"AR admission: K={args.memory_tokens} tokens, one per step")
     wandb.config.update({"param_counts": param_counts})
 
     # fused AdamW: same math, one kernel — a few % on a model this small

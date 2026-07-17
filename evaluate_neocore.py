@@ -34,11 +34,34 @@ import numpy as np
 
 from dataset import get_dataloaders, IMAGENET_MEAN, IMAGENET_STD
 from model_neocore import NeocoreAE
+from model_neocore_ar import NeocoreARAE
 
 
 def load_model(path: str, device: torch.device):
     ckpt = torch.load(path, map_location=device, weights_only=True)
     a = ckpt["args"]
+    if a.get("arch", "loop") == "ar":
+        model = NeocoreARAE(
+            image_size      = a["image_size"],
+            patch_size      = a["patch_size"],
+            d_model         = a["d_model"],
+            num_heads       = a["num_heads"],
+            core_blocks     = a["core_blocks"],
+            mlp_ratio       = a["mlp_ratio"],
+            memory_tokens   = a["memory_tokens"],
+            decoder_d_model = a["decoder_d_model"],
+            decoder_blocks  = a["decoder_blocks"],
+            decoder_heads   = a["decoder_heads"],
+            norm_pix_loss   = not a.get("no_norm_pix", False),
+        )
+        state_dict = {k.replace("_orig_mod.", "", 1): v
+                      for k, v in ckpt["model"].items()}
+        model.load_state_dict(state_dict)
+        model.to(device).eval()
+        print(f"Loaded {path} — epoch {ckpt['epoch'] + 1}, "
+              f"val rec {ckpt.get('val_rec', float('nan')):.4f}, "
+              f"AR K={a['memory_tokens']}")
+        return model, a
     model = NeocoreAE(
         image_size       = a["image_size"],
         patch_size       = a["patch_size"],
@@ -180,7 +203,7 @@ def admission_stats(model, loader, device, out_dir, max_batches):
         images = images.to(device, non_blocking=True)
         with torch.autocast(device_type=device.type, dtype=torch.bfloat16,
                             enabled=device.type == "cuda"):
-            loss_rec, overlap, corr = model(images)
+            loss_rec, overlap, corr, _stab = model(images)
             preds, admits, admit_round = model.round_trace(images)
 
         target = model.patchify(images)

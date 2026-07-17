@@ -48,6 +48,7 @@ from dataset import get_dataloaders
 from model_asfnet_br import ASFNetBR
 from model_asfnet_ae_ladder import ASFNetAELadder
 from model_neocore import NeocoreAE
+from model_neocore_ar import NeocoreARAE
 from utils import AverageMeter
 
 
@@ -180,6 +181,28 @@ def load_backbone(args, device) -> tuple[ASFNetBR, dict]:
     if "rounds" in a and "core_blocks" in a:
         # Neocore checkpoint: the whole model is the backbone (decoder
         # weights load too but the probe never calls them).
+        if a.get("arch", "loop") == "ar":
+            model = NeocoreARAE(
+                image_size      = a["image_size"],
+                patch_size      = a["patch_size"],
+                d_model         = a["d_model"],
+                num_heads       = a["num_heads"],
+                core_blocks     = a["core_blocks"],
+                mlp_ratio       = a["mlp_ratio"],
+                memory_tokens   = a["memory_tokens"],
+                decoder_d_model = a["decoder_d_model"],
+                decoder_blocks  = a["decoder_blocks"],
+                decoder_heads   = a["decoder_heads"],
+                norm_pix_loss   = not a.get("no_norm_pix", False),
+            )
+            sd = {k.replace("_orig_mod.", "", 1): v
+                  for k, v in ckpt["model"].items()}
+            model.load_state_dict(sd, strict=True)
+            print(f"Loaded Neocore-AR model from {ckpt_path} "
+                  f"(AE epoch {ckpt['epoch'] + 1}, K={a['memory_tokens']}, "
+                  f"{len(sd)} tensors)")
+            model.to(device)
+            return model, a
         model = NeocoreAE(
             image_size        = a["image_size"],
             patch_size        = a["patch_size"],
