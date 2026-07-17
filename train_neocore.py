@@ -30,7 +30,6 @@ import torch.nn as nn
 import wandb
 from tqdm import tqdm
 
-from dataset import get_dataloaders
 from model_neocore import NeocoreAE
 from utils import AverageMeter
 
@@ -204,6 +203,17 @@ def main():
     parser.add_argument("--dataset_cache_dir", type=str, default="./data")
     parser.add_argument("--jpeg_cache_dir",    type=str, default="./jpeg_cache")
     parser.add_argument("--num_workers",       type=int, default=8)
+    parser.add_argument("--data", type=str, default="dali",
+                        choices=["dali", "ram"],
+                        help="dali: decode-per-epoch pipeline (dataset.py). "
+                             "ram: raw uint8 blob resident in RAM/VRAM with "
+                             "GPU-side augmentation (dataset_ram.py) — a "
+                             "pipeline epoch; don't mix within a series.")
+    parser.add_argument("--data_device", type=str, default="cpu",
+                        choices=["cpu", "cuda"],
+                        help="ram only: where the 25 GB blob lives. cuda = "
+                             "fully VRAM-resident, zero PCIe per step "
+                             "(needs headroom above the model's peak).")
 
     # --- Infrastructure ---
     parser.add_argument("--checkpoint_dir", type=str, default=None,
@@ -261,7 +271,12 @@ def main():
                       f"retry {attempt + 1}/23 in {wait}s")
                 time.sleep(wait)
 
-    train_loader, val_loader = get_dataloaders(args)
+    if args.data == "ram":
+        from dataset_ram import get_ram_dataloaders
+        train_loader, val_loader = get_ram_dataloaders(args)
+    else:
+        from dataset import get_dataloaders   # imports DALI — instance only
+        train_loader, val_loader = get_dataloaders(args)
 
     model = build_model(args).to(device)
     model = torch.compile(model, mode=args.compile_mode)
