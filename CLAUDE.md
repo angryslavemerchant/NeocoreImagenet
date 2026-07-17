@@ -243,11 +243,17 @@ partial activation checkpointing (batch 1024 uncheckpointed OOMs at
    Speed levers left are architectural, not plumbing. (max-autotune ≈
    nil, fused AdamW ≈ nil; the real win was checkpoint_rounds.)
 9. **RAM blob cache built + validated** (dataset_ram.py): train 24.9 GB /
-   val 1.0 GB uint8 blobs; both cpu and VRAM-resident modes work. Blobs
-   live on STOPPED sandbox instance 45137008 (keep stopped, do not
-   destroy — the disk holds them). Morning task WITH the user: wire a
-   Google Drive (or wandb/HF) dataset bank around these blobs — the
-   train blob exceeds Drive's free 15 GB, needs a user decision.
+   val 1.0 GB uint8 blobs; both cpu and VRAM-resident modes work.
+   **Dataset bank (2026-07-17 afternoon): ensure_ram_cache resolves
+   local → bank pull → full HF build.** Backend via RAM_BANK env:
+   `wandb` (default — artifact `imagenet100-ram256:latest`, publish once
+   with vast/upload_blobs.py) or `gdrive` (rclone; dormant until
+   RCLONE_DRIVE_TOKEN lands in secrets.env — needs user's OAuth click +
+   ≥26 GB Drive headroom). HARD LESSON: Vast stop→start re-runs the
+   provision command, which `rm -rf`s the repo — a restart WIPED the
+   blobs on sandbox 45137008 ("stop to preserve state" does not work).
+   onstart now symlinks jpeg_cache/ + data/ into /workspace so caches
+   survive same-machine restarts; the bank is the real persistence.
 
 Checkpoints/panels in runs/NC_R{1,2,4,7}_K49_300ep/; wandb artifacts
 neocore-{i0tqyho2,2wa5npcb,3p04yekp,ab1e8nam}:final. Sweep figure:
