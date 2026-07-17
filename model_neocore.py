@@ -106,8 +106,11 @@ class NeocoreAE(nn.Module):
         self.score_head = nn.Linear(d_model, 1)
         # In-memory marker: stamped ONCE, at admission — strictly binary
         # information ("you are in memory"), no round index. It persists
-        # through later rounds via the residual stream.
-        self.marker = nn.Parameter(torch.zeros(1, 1, d_model))
+        # through later rounds via the residual stream. Kept 1-D: compiled
+        # backward under per-round checkpointing mis-shaped the gradient
+        # of a (1, 1, D) broadcast parameter (RTX PRO 6000 speed test,
+        # 2026-07-17); a (D,) parameter reduces unambiguously.
+        self.marker = nn.Parameter(torch.zeros(d_model))
         nn.init.normal_(self.marker, std=0.02)
 
         # ---- Decoder (MAE-style, lightweight) ----
