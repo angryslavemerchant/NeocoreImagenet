@@ -142,9 +142,11 @@ def add_to_blacklist(machine_id: int):
 
 def search_offers(gpu: str, max_dph: float, inet: int = 500, limit: int = 40):
     # No reliability filter (user: doesn't matter). cuda>=12.8 for Blackwell.
+    # cpu_ram>=48: the RAM-blob loader holds the 25 GB train blob in system
+    # RAM (on 32 GB cards the dataset can't live in VRAM).
     query = (f"gpu_name={gpu} num_gpus=1 rentable=true verified=true "
              f"inet_down>={inet} disk_space>={DISK_GB} "
-             f"cpu_cores_effective>=8 cpu_ram>=32 "
+             f"cpu_cores_effective>=8 cpu_ram>=48 "
              f"cuda_max_good>=12.8 dph<={max_dph}")
     offers = vast("search", "offers", query, "-o", "dph")
     if not isinstance(offers, list):
@@ -273,6 +275,7 @@ def cmd_launch(args):
     secrets = load_secrets()
     if args.smoke:
         args.train_args = ("--num_epochs 1 --batch_size 256 "
+                           "--data ram --compile_mode default "
                            "--run_name smoke_test")
         args.keep_alive = True
 
@@ -497,10 +500,11 @@ def main():
     sub = p.add_subparsers(dest="cmd", required=True)
 
     def common(sp):
-        # RTX 6000 Blackwell workstation cards; B200 for occasional rapid
-        # runs via --gpu B200 (note: B200 market floor may exceed max-dph).
-        sp.add_argument("--gpu",     type=str,   default="RTX_PRO_6000_WS")
-        sp.add_argument("--max-dph", type=float, default=1.2, dest="max_dph")
+        # USER DIRECTIVE 2026-07-17: single RTX 5090 is the default class
+        # (burn-rate cut; 32 GB is enough at batch 256). RTX_PRO_6000_WS /
+        # B200 only when the user explicitly asks for a fast run.
+        sp.add_argument("--gpu",     type=str,   default="RTX_5090")
+        sp.add_argument("--max-dph", type=float, default=0.6, dest="max_dph")
         sp.add_argument("--inet",    type=int,   default=500)
         sp.add_argument("--branch",  type=str,   default="master")
 
@@ -508,12 +512,21 @@ def main():
 
     sp = sub.add_parser("launch");  common(sp)
     sp.add_argument("--offer",      type=int, default=None)
+    # Default recipe = the single-5090 profile (32 GB): batch 256 with lr
+    # linearly rescaled from the 1024/3e-3 recipe, data blobs in system RAM
+    # (dataset does not fit in VRAM), compile default (max-autotune measured
+    # ~nil and its private pools eat headroom), ck3 partial checkpointing
+    # (~15 GB for loop-R7; ignored by non-loop archs).
     sp.add_argument("--train-args", type=str, dest="train_args",
-                    default="--num_epochs 300 --artifact_every 25")
+                    default="--num_epochs 300 --artifact_every 25 "
+                            "--batch_size 256 --lr 7.5e-4 "
+                            "--checkpoint_rounds 3 --data ram "
+                            "--compile_mode default")
     sp.add_argument("--train-script", type=str, dest="train_script",
-                    default=None,
-                    help="Alternative training entry point (e.g. "
-                         "train_linear_probe.py); default is the AE trainer")
+                    default="train_neocore.py",
+                    help="Training entry point; default is the Neocore "
+                         "trainer (pass train_linear_probe.py etc. for "
+                         "other runs)")
     sp.add_argument("--keep-alive", action="store_true", dest="keep_alive")
     sp.add_argument("--smoke",      action="store_true",
                     help="1-epoch pipeline test with keep-alive")

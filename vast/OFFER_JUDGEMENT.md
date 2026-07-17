@@ -4,7 +4,27 @@ For the agent operating `vast/launch.py`: do NOT blindly auto-pick. Run
 `launch.py search`, look at the full table, choose an offer with the criteria
 below, then `launch.py launch --offer <ID>`.
 
-## User briefing (2026-07-14) — authoritative
+## User briefing (2026-07-17) — authoritative, supersedes GPU-class rules below
+
+1. **Default GPU class: single RTX 5090 (`RTX_5090`, num_gpus=1).** The
+   user cut the burn rate: 96 GB cards were overkill for these ~6 M-param
+   models. RTX PRO 6000 WS / B200 only when the user explicitly asks for a
+   fast run. Market at briefing time: 45 offers, floor $0.296/hr, median
+   $0.497/hr. Default cap $0.60/hr.
+2. **Training recipe on a 5090 (32 GB)** — launch.py's default train-args:
+   batch 256, lr 7.5e-4 (linearly rescaled from the 1024/3e-3 recipe),
+   `--data ram` with the blob in **system RAM** (the 25 GB train blob does
+   not fit in 32 GB VRAM — never pass `--data_device cuda` on this class),
+   `--compile_mode default`, `--checkpoint_rounds 3` (loop archs; ~15 GB
+   for R7 at batch 256). Expect ~2x the PRO-6000 epoch time (~160 s for an
+   R7-class run) at roughly half the hourly cost.
+3. **CPU rules relax on this class**: the 5090 market is nearly all EPYC
+   hosts, and with the RAM-blob loader (GPU-side aug, torch-only) training
+   is GPU-bound — EPYC is fine now. Still avoid the genuine toasters
+   (6-core Ryzen 3600 / 7500F class). **cpu_ram ≥ 48 GB is a hard
+   requirement** (25 GB blob lives in system RAM).
+
+## User briefing (2026-07-14) — GPU-class rules superseded above
 
 1. **GPU classes: RTX 6000 Blackwell (`RTX_PRO_6000_WS`) only**, plus the
    occasional **B200** rapid run when the user asks for one.

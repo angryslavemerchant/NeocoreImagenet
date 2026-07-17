@@ -280,8 +280,18 @@ runs/night_analysis.png. Full night narrative in POINTS_OF_INTEREST.md.
 
 Everything is driven by `vast/launch.py`. **Offer selection is a judgment
 call by the operating agent**: run `search`, apply `vast/OFFER_JUDGEMENT.md`
-(price near the middle of the range, consumer CPUs, known-bad machine list),
-then `launch --offer <ID>`. Auto-pick only as a fallback.
+(price near the middle of the range, known-bad machine list), then
+`launch --offer <ID>`. Auto-pick only as a fallback.
+
+**Fleet policy (user directive 2026-07-17): single RTX 5090 per run is the
+default** — the 96 GB cards were burn-rate overkill for ~6 M-param models.
+5090 recipe (launch.py's default train-args): batch 256, lr 7.5e-4
+(linear-scaled from the 1024 / 3e-3 recipe), `--data ram` with blobs in
+**system RAM** (25 GB blob does not fit 32 GB VRAM — no `--data_device
+cuda` on this class), `--compile_mode default`, `--checkpoint_rounds 3`.
+EPYC hosts are fine now (RAM loader is GPU-bound); cpu_ram ≥ 48 GB
+required. Expect ~2x PRO-6000 epoch time at ~half the hourly cost.
+RTX_PRO_6000_WS / B200 only when the user explicitly asks for a fast run.
 
 ```powershell
 & "C:\Users\JmgLi\anaconda3\envs\ToastEnv\python.exe" vast\launch.py status
