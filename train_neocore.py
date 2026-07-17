@@ -32,6 +32,7 @@ from tqdm import tqdm
 
 from model_neocore import NeocoreAE
 from model_neocore_ar import NeocoreARAE
+from model_conv_ae import ConvAE
 from utils import AverageMeter
 
 
@@ -43,6 +44,16 @@ def set_seed(seed: int):
 
 
 def build_model(args):
+    if args.arch == "conv":
+        # Convolutional control: same 49x256 bottleneck rate, no tokens,
+        # no selection. ALL-POSITION loss — not comparable to dropped-only
+        # numbers (see model_conv_ae.py docstring).
+        return ConvAE(
+            image_size    = args.image_size,
+            in_channels   = 3,
+            patch_size    = args.patch_size,
+            norm_pix_loss = not args.no_norm_pix,
+        )
     if args.arch == "ar":
         # AR sibling: bidirectional encode once + one-at-a-time causal
         # memory generation (KV-cached at eval, replay-trained). rounds /
@@ -195,12 +206,14 @@ def main():
 
     # --- The loop (both architectural constants — the law) ---
     parser.add_argument("--arch", type=str, default="loop",
-                        choices=["loop", "ar"],
+                        choices=["loop", "ar", "conv"],
                         help="loop: recursive full-grid re-encoding "
                              "(model_neocore). ar: encode once + one-at-a-"
                              "time causal memory generation "
-                             "(model_neocore_ar); rounds/reselect/"
-                             "checkpoint_rounds are ignored.")
+                             "(model_neocore_ar). conv: plain conv AE at "
+                             "the same 49x256 rate, ALL-position loss "
+                             "(model_conv_ae). Non-loop archs ignore "
+                             "rounds/reselect/checkpoint_rounds.")
     parser.add_argument("--rounds", type=int, default=7,
                         help="R recursive passes of the shared core; "
                              "R=1 == the one-shot budget model (control).")
@@ -288,7 +301,9 @@ def main():
         parser.error("--reselect applies to the loop arch only")
 
     if args.run_name is None:
-        if args.arch == "ar":
+        if args.arch == "conv":
+            args.run_name = "NCONV_K49"
+        elif args.arch == "ar":
             args.run_name = (f"NCAR_K{args.memory_tokens}"
                              f"_D{args.d_model}x{args.core_blocks}")
         else:
@@ -338,8 +353,11 @@ def main():
     if hasattr(model, "admit_schedule"):
         print(f"Admission schedule: {model.admit_schedule} "
               f"(K={args.memory_tokens} over R={args.rounds} rounds)")
-    else:
+    elif args.arch == "ar":
         print(f"AR admission: K={args.memory_tokens} tokens, one per step")
+    else:
+        print("Conv AE: 7x7x256 bottleneck, no admission, "
+              "ALL-position loss")
     wandb.config.update({"param_counts": param_counts})
 
     # fused AdamW: same math, one kernel — a few % on a model this small

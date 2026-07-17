@@ -35,11 +35,26 @@ import numpy as np
 from dataset import get_dataloaders, IMAGENET_MEAN, IMAGENET_STD
 from model_neocore import NeocoreAE
 from model_neocore_ar import NeocoreARAE
+from model_conv_ae import ConvAE
 
 
 def load_model(path: str, device: torch.device):
     ckpt = torch.load(path, map_location=device, weights_only=True)
     a = ckpt["args"]
+    if a.get("arch", "loop") == "conv":
+        model = ConvAE(
+            image_size    = a["image_size"],
+            patch_size    = a["patch_size"],
+            norm_pix_loss = not a.get("no_norm_pix", False),
+        )
+        state_dict = {k.replace("_orig_mod.", "", 1): v
+                      for k, v in ckpt["model"].items()}
+        model.load_state_dict(state_dict)
+        model.to(device).eval()
+        print(f"Loaded {path} — epoch {ckpt['epoch'] + 1}, "
+              f"val rec {ckpt.get('val_rec', float('nan')):.4f} "
+              f"(ALL-position), ConvAE 7x7x256")
+        return model, a
     if a.get("arch", "loop") == "ar":
         model = NeocoreARAE(
             image_size      = a["image_size"],
