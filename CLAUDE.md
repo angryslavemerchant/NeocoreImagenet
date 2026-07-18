@@ -269,6 +269,43 @@ Checkpoints/panels in runs/NC_R{1,2,4,7}_K49_300ep/; wandb artifacts
 neocore-{i0tqyho2,2wa5npcb,3p04yekp,ab1e8nam}:final. Sweep figure:
 runs/night_analysis.png. Full night narrative in POINTS_OF_INTEREST.md.
 
+## Research checkpoint (2026-07-18) — the benchmark verdict: wrong objective, confirmed
+
+Three 300-ep runs completed (artifacts neocore-{bnjvgd3s,tz18glu6,v9k6rg2u}):
+
+1. **Reselect-R7** (`NC_R7_K49_resel_300ep`): best rec 0.1292 / final
+   0.1599 — WORSE than R1 (0.0989) despite 7 passes. Depth-vs-memory
+   partially resolved: accumulate-R7's gain (0.0871) is not depth — it's
+   sticky accumulation; re-picking each round actively hurts and the run
+   degraded late (re-stamp norm growth suspected). mem_stability 0.61.
+2. **Neocore-AR** (`NCAR_K49_300ep`): best rec 0.1033 ≈ R1. overlap_r1
+   0.88 — token-by-token conditioning barely deviates from its own
+   one-shot ranking. Strict sequentiality bought nothing.
+3. **ConvAE** (`NCONV_K49_300ep`): best rec **0.0516 all-position** — 4x
+   better than AE_xattn49's 0.211 at the identical 49x256 rate, zero
+   selection machinery. train 72 s/epoch (not faster than transformers:
+   early high-res conv stages carry the FLOPs; GPU-bound at 100%).
+4. **ConvAE probe (the decisive number): top-1 28.2 / top-5 55.7** —
+   dead middle of the 49-token pack (budget25 26.5, R1 28.8, R2 29.5,
+   R7 26.3) despite 4x better reconstruction. **Both directions of the
+   dissociation are now measured: rec and linear semantics are
+   orthogonal under this objective.** All 49-token bottlenecks probe
+   26-30% regardless of mechanism; only all-196 pooling exceeds it
+   (32-35.5). Pixel reconstruction at fixed rate is rate-determined,
+   architecture-blind, and semantics-blind: it cannot see the admission
+   machinery this project is about. Next objective candidates (user
+   deciding): distillation from a frozen teacher (DINOv2-S), JEPA-style
+   latent prediction of dropped tokens, supervised fine-tune. Queued
+   discriminator still open: R7 with RANDOM admission order.
+
+Ops (2026-07-18): probes are ~7 s/epoch on a 5090 (21 min / 180 ep,
+~$0.11). Boot lottery (`launch --hedge 3`, default) deployed after two
+dead boots (m91308 zombie, m137831 second self-stop; both blacklisted):
+races N distinct machines, first GATE_PASSED wins, losers destroyed
+(~$0.05 each). ConvAE/NeocoreARAE probe path fixed (token_norm d_feat,
+Neocore-family isinstance dispatch) — ProbeModel now smoke-tested
+locally against every backbone family before cloud runs.
+
 ## Local environment (Windows)
 
 - No `python` on PATH. The project env is the `ToastEnv` conda env:
