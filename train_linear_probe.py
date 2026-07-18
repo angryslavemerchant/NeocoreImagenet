@@ -100,11 +100,12 @@ class ProbeModel(nn.Module):
             p.requires_grad = False
 
     def forward(self, images: torch.Tensor) -> torch.Tensor:
-        if isinstance(self.backbone, NeocoreAE):
-            # Neocore: nothing is dropped during encoding, so the two probe
-            # sets are MEMORY (the K admitted tokens — what the bottleneck
-            # actually carries; the default) and ALL 196 tokens (--topk 0 —
-            # the encoder-as-ViT upper bound).
+        if isinstance(self.backbone, (NeocoreAE, NeocoreARAE, ConvAE)):
+            # Neocore family (loop/AR/conv control): forward_features is the
+            # 3-tuple (tokens, admitted, admit_round). The two probe sets
+            # are MEMORY (the K admitted tokens — what the bottleneck
+            # actually carries; the default) and ALL tokens (--topk 0 —
+            # the encoder-as-ViT upper bound; == memory for ConvAE).
             feats, admitted, _ = self.backbone.forward_features(images)
             pad_mask = torch.zeros_like(admitted) if self.topk == 0 \
                 else ~admitted
