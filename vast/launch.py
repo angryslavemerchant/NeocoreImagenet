@@ -312,6 +312,83 @@ def create_instance(offer_id: int, secrets: dict, branch: str,
     return iid
 
 
+def hedged_launch(args, secrets, gpu, max_dph):
+    """Boot lottery (user strategy 2026-07-17, after two dead boots in a
+    row): create N instances on N distinct machines, poll logs, keep the
+    FIRST to pass the health gate, destroy the rest. Zombie boots produce
+    no logs and self-stopping hosts never reach the gate, so both failure
+    modes lose the race silently at ~$0.05/loser instead of costing a
+    35-minute diagnosis each. Losers killed just after their gate may
+    leave a crashed wandb stub — harmless."""
+    offers = search_offers(gpu, max_dph, args.inet)
+    if not offers:
+        sys.exit("No offers matched the filters.")
+    median_dph = statistics.median(o["dph_total"] for o in offers)
+    offers.sort(key=lambda o: abs(o["dph_total"] - median_dph))
+    picked, seen = [], set()
+    for o in offers:
+        if o.get("machine_id") not in seen:
+            picked.append(o)
+            seen.add(o.get("machine_id"))
+        if len(picked) == args.hedge:
+            break
+    if len(picked) < 2:
+        sys.exit(f"Only {len(picked)} distinct machines available - "
+                 "not enough to race.")
+
+    racers, all_created = {}, set()
+    for o in picked:
+        try:
+            iid = create_instance(o["id"], secrets, args.branch,
+                                  args.train_args, bench_only=False,
+                                  keep_alive=args.keep_alive,
+                                  purpose="train",
+                                  train_script=args.train_script)
+            racers[iid] = o
+            all_created.add(iid)
+            print(f"  racer {iid} on m{o.get('machine_id')} "
+                  f"(${o.get('dph_total', 0):.3f}/hr)")
+        except Exception as e:
+            print(f"  offer {o['id']}: create failed ({e})")
+    if not racers:
+        sys.exit("No racers created.")
+
+    winner = None
+    deadline = time.time() + 25 * 60
+    print(f"\nRacing {len(racers)} boots; first GATE_PASSED wins "
+          "(polling every 45 s, 25 min timeout)...")
+    while time.time() < deadline and winner is None and racers:
+        time.sleep(45)
+        for iid in list(racers):
+            logs = get_logs_text(iid)
+            if "GATE_PASSED" in logs:
+                winner = iid
+                break
+            if "GATE_FAILED" in logs or "SELF_DESTROY" in logs:
+                print(f"  {iid}: failed its health gate, dropping")
+                vast("destroy", "instance", iid, "-y", check=False)
+                del racers[iid]
+            elif "ONSTART_BEGIN" in logs:
+                print(f"  {iid}: booted, benchmarking...")
+
+    losers = [iid for iid in racers if iid != winner]
+    for iid in losers:
+        vast("destroy", "instance", iid, "-y", check=False)
+        print(f"  destroyed loser {iid} (m{racers[iid].get('machine_id')})")
+    save_state([r for r in load_state()
+                if r["id"] == winner or r["id"] not in all_created])
+
+    if winner is None:
+        sys.exit("No racer passed the gate within the timeout - all "
+                 "destroyed. Machines tried: "
+                 + ", ".join(f"m{o.get('machine_id')}" for o in picked))
+    print(f"\nWinner: instance {winner} on "
+          f"m{racers[winner].get('machine_id')} - training proceeds.")
+    print(f"  watch:   python vast/launch.py logs --id {winner}")
+    print(f"  destroy: python vast/launch.py destroy --id {winner}")
+    return winner
+
+
 def cmd_launch(args):
     secrets = load_secrets()
     prof, gpu, max_dph = resolve_profile(args)
@@ -324,6 +401,10 @@ def cmd_launch(args):
         args.keep_alive = True
     print(f"Profile {args.profile} ({gpu}, cap ${max_dph}/hr)")
     print(f"  train args: {args.train_args}")
+
+    if args.offer is None and args.hedge > 1:
+        hedged_launch(args, secrets, gpu, max_dph)
+        return
 
     offer_id = args.offer
     if offer_id is None:
@@ -577,6 +658,10 @@ def main():
     sp.add_argument("--keep-alive", action="store_true", dest="keep_alive")
     sp.add_argument("--smoke",      action="store_true",
                     help="1-epoch pipeline test with keep-alive")
+    sp.add_argument("--hedge", type=int, default=3,
+                    help="Race N boots on distinct machines; first to pass "
+                         "the health gate wins, losers destroyed "
+                         "(~$0.05 each). 1 = single launch, or use --offer.")
     sp.set_defaults(fn=cmd_launch)
 
     sp = sub.add_parser("scan");    common(sp)

@@ -105,6 +105,9 @@ below, then `launch.py launch --offer <ID>`.
   running/success but zero onstart logs for 3 h and ssh refused on the
   advertised port. (Same machine booted fine earlier that day —
   intermittent.) 2026-07-16
+- machine 91308 — EPYC 7742 RTX 5090, California. Zombie boot: stuck in
+  "loading" 35 min, zero onstart logs, gpu_util null, no status_msg;
+  user saw an error in the console. 2026-07-17
 - machine 14825 — docker daemon broken (OCI runtime create failed), 2026-07-14
 - machine 9020  — instances wedge in created/stopped, never boot; ignores
   explicit start, 2026-07-14
