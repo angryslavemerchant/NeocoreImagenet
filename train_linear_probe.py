@@ -378,8 +378,10 @@ def main():
     wandb.config.update({"ae_args": ae_args, "resolved_topk": topk})
     print(f"Probe: pool={args.pool}, topk={topk or 'all survivors'}")
 
-    d_feat = backbone.norm.normalized_shape[0]   # final-stage width (works
-    model = ProbeModel(backbone, d_feat, ae_args["num_heads"],  # for ladder too)
+    # final-stage width (ladder too); ConvAE names its output LN token_norm
+    final_norm = getattr(backbone, "norm", None) or backbone.token_norm
+    d_feat = final_norm.normalized_shape[0]
+    model = ProbeModel(backbone, d_feat, ae_args.get("num_heads", 8),
                        args.num_classes, args.pool, topk).to(device)
     model = torch.compile(model)
 
