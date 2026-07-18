@@ -306,6 +306,48 @@ races N distinct machines, first GATE_PASSED wins, losers destroyed
 Neocore-family isinstance dispatch) — ProbeModel now smoke-tested
 locally against every backbone family before cloud runs.
 
+## Research checkpoint (2026-07-18 night) — the vocabulary program opens
+
+Direction change after the benchmark verdict + a day of theory (full
+argument in POINTS_OF_INTEREST.md): blocks-first. Chunking = compression
+forced through composition over a REUSABLE vocabulary; pixel-loss joint
+training could never produce it (per-image rec never pays for reuse; the
+free decoder was where the hidden vocabulary leaked). New stack: frozen
+DINOv2 blocks -> explicit discrete vocabulary -> selection/arrangement
+machinery on top (dumb compositor, code-index targets). Key literature
+anchors: DINOSAUR (slots on frozen DINO features work; joint training
+degrades), TokenCut/CutLER (chunks are latent in frozen affinities),
+I-JEPA (latent targets probe; pixel targets don't), FSQ (VQ stability =
+freeze the vocabulary).
+
+**Stage 0-1 DONE (train_vocab.py, run VOCAB_stage01, ~$0.25 total):**
+- Token lake: DINOv2-S/14 patch+CLS tokens for all of IN-100 (26 GB
+  fp16, 2100 img/s extraction; rebuildable in ~15 min, not banked).
+- EMA k-means codebooks K∈{512..8192}: 92-97% perplexity utilization,
+  healthy Zipf-ish usage. Figures + codebooks: runs/VOCAB_stage01/ +
+  wandb artifact vocab-6duv9qzw.
+- **The block-quality gap, measured: DINOv2 patch tokens probe 93.5
+  top-1 on IN-100** (attentive, no-aug lake protocol; CLS kNN 92.0)
+  vs 35.5 for the best pixel-trained encoder ever built here. ~58 pts
+  was block quality, not chunking.
+- **Symbolization is semantically nearly free: K=8192 quantized probe
+  92.1 (-1.4 pt from raw), K=1024 87.9** — while cosine fidelity is only
+  0.73/0.66: geometrically lossy, semantically lossless. 256 symbols x
+  13 bits ≈ 416 B/image carries 92% linear class accuracy (~470x vs raw
+  fp16 tokens).
+- Caveat: lake-probe numbers (no aug, deterministic crop) are not
+  comparable to the train_linear_probe.py table; only within-lake
+  comparisons are fair.
+
+Stage 2 (designed, not started): Neocore admission machinery over the
+lake — memory = K pointers into the codebook, reconstruction = predict
+dropped positions' CODE INDICES (classification over vocabulary; no
+continuous decoder to leak through). Instruments: admission maps in
+code space, assignment-matrix chunk maps, random-admission control,
+TokenCut reference parses. Open beyond: recurrence-triggered promotion
+(mint new vocab entries for recurring arrangements — online BPE over
+parses), episode-structured data (video) as the pressure for caching.
+
 ## Local environment (Windows)
 
 - No `python` on PATH. The project env is the `ToastEnv` conda env:
