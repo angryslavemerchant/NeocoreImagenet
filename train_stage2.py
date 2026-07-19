@@ -263,9 +263,17 @@ def get_codebook(args, device) -> torch.Tensor:
     if local.exists():
         return torch.load(local, map_location="cpu")
     import wandb
-    art = wandb.Api().artifact(args.codebook_artifact)
-    d = Path(art.download())
-    return torch.load(d / local.name, map_location="cpu")
+    for attempt in range(5):        # wandb API hiccups killed a boot once
+        try:
+            art = wandb.Api().artifact(args.codebook_artifact)
+            d = Path(art.download())
+            return torch.load(d / local.name, map_location="cpu")
+        except Exception as e:
+            if attempt == 4:
+                raise
+            wait = 30 * (attempt + 1)
+            print(f"[codes] artifact fetch failed ({e}); retry in {wait}s")
+            time.sleep(wait)
 
 
 # ---------------------------------------------------------------------------
