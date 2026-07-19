@@ -101,6 +101,12 @@ below, then `launch.py launch --offer <ID>`.
 
 ## Known-bad machines (add as found; also `.vast/blacklist.json`)
 
+- machine 43567 — EPYC 9654, Washington US, rel 0.997. Booted into a
+  DNS-dead container (status_msg `curl: (6) Could not resolve host:
+  cloud.vast.ai`, 16+ min "loading", zero logs — onstart cannot even
+  clone). 2026-07-19. High reliability score, broken networking: the
+  status_msg field is the tell — check it when logs stay empty.
+
 - machine 12092 — Core Ultra 9 285K, Nevada. Instance never booted (no
   ONSTART after ~7 min, no logs) and vanished from the API; user confirmed
   it never loaded, 2026-07-15.
