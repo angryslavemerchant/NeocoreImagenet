@@ -86,9 +86,12 @@ below, then `launch.py launch --offer <ID>`.
 
 ## Machines with a caution flag (usable, watch them)
 
-- machine 69554 — RTX 5090. Dropped a contract mid-run (instance vanished
-  from the API at ~epoch 60-of-120 of a stage-2 arm, no error, no logs;
-  host-side kill). One offense 2026-07-19; blacklist on a second.
+- machine 69554 — RTX 5090. EXONERATED 2026-07-19: the "dropped contract"
+  was a monitoring false alarm — the run had COMPLETED and self-destroyed
+  inside the watcher's 5-min poll gap (wandb shows finished + verified
+  artifact). Machine is fine. Lesson for watchers: an instance vanishing
+  is only a failure if wandb does NOT show the run finished — always
+  cross-check before re-renting.
 
 - machine 137683 — Ryzen 9 9950X3D, Germany. Excellent performer (402
   TFLOPS, ran two clean speed tests 2026-07-17), but ONCE spontaneously
