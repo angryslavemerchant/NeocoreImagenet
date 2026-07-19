@@ -86,6 +86,10 @@ below, then `launch.py launch --offer <ID>`.
 
 ## Machines with a caution flag (usable, watch them)
 
+- machine 69554 — RTX 5090. Dropped a contract mid-run (instance vanished
+  from the API at ~epoch 60-of-120 of a stage-2 arm, no error, no logs;
+  host-side kill). One offense 2026-07-19; blacklist on a second.
+
 - machine 137683 — Ryzen 9 9950X3D, Germany. Excellent performer (402
   TFLOPS, ran two clean speed tests 2026-07-17), but ONCE spontaneously
   stopped a fresh container ~2 min after boot (intended_status=stopped,
