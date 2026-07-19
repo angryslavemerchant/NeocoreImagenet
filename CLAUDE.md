@@ -348,6 +348,53 @@ TokenCut reference parses. Open beyond: recurrence-triggered promotion
 (mint new vocab entries for recurring arrangements — online BPE over
 parses), episode-structured data (video) as the pressure for caching.
 
+## Research checkpoint (2026-07-19, session close) — the globality law
+
+Classification sweep (train_vocab_cls.py, project neocore-cls; user
+stopped it early — result decisive at 4 configs; NOTE: all configs
+merged into ONE wandb run 3np8mz3l because run_training.sh exports a
+fixed WANDB_RUN_ID and per-config wandb.init resumed it — pop that env
+var before reusing the script; per-config numbers recovered by
+splitting history on epoch resets):
+
+- CLS_dense (256 tok):    90.52
+- CLS_learned_B4_R4:      89.68  (retention_r3 0.78)
+- CLS_random_B4_R4:       89.66  (exact tie with learned)
+- CLS_learned_B8_R4 (20ep): 89.78 (retention_r3 0.96)
+
+**FOUR tokens ≈ 256 tokens (Δ0.9 pt) and learned == random to 0.02.**
+The budget never binds because admission happens over POST-ATTENTION
+tokens: 2 shallow blocks (and DINO's 12 before them) make every token a
+global summary, so any 4 carry the scene. Selection over summaries is
+value-free.
+
+**The session's law, final form: any component that sees everything
+dissolves the selection question.** Pixel era: the free decoder. Stage
+2: DINO contextualization inflating all arms. Classification: the
+shallow encoder. Selection/chunking is only measurable — and only
+VALUABLE — when information is forced to flow THROUGH the bottleneck:
+admission over LOCAL (pre-mixing) tokens, perception spent only on what
+was admitted (foveation, not summarization), and reuse pressure across
+episodes so caching pays. Those are the requirements for the next
+architecture, whenever it's built.
+
+Positive residue of the day, all reusable: the vocabulary stack (93.5
+raw / 92.1 @ 8k codes; codebooks + lake pipeline; ~$0.10-1 experiments
+at same-afternoon cadence), the instrument suite (coverage curves,
+retention, freq_overlap, census), and one small gem: given the choice,
+learned admission spontaneously converged to ACCUMULATE (retention
+0.78-0.96) — the model's own answer to reselect-vs-accumulate matches
+the pixel-era finding.
+
+Ops residue: boot race (--hedge), Drive-bank gate + download gate,
+hardware floors recalibrated from first 5090 scan (221-229 TFLOPS
+healthy), live-machine exclusion in offer search, cmd_scan median
+crash fixed, scan requires --branch vast-automation until merge.
+2026-07-19 network event: US mid-band hosts measured 9-20 mbps to BOTH
+HF and Drive (endpoint or DC-side; gate correctly blocks launches
+there). m59009/m69554/m139253 all exonerated — every "bad machine"
+today was monitoring artifacts or the network event.
+
 ## Research checkpoint (2026-07-19) — stage 2 six-arm verdict: random wins, selection machinery loses
 
 train_stage2.py, 6 arms x 3 budgets, ~$5 total, figure
