@@ -1,9 +1,9 @@
 {
-  "_comment": "Floors updated 2026-07-19 (5090 fleet, bank-era boot path). download_mbps promoted from info-only; drive_pull_mbps gates the rclone->Drive path the boot actually depends on (80 mbps = 10 MB/s; the 2026-07-19 slow host measured ~27). gpu/disk/cpu/pcie remain broken-hardware floors, not performance bars.",
+  "_comment": "Floors updated 2026-07-19 from the first 5090 fleet scan (221-229 TFLOPS, 396-427 MB/s disk, 16-18 GB/s H2D measured healthy). Hardware keys are broken-hardware floors valid for 5090/6000/B200 profiles. Network keys: drive_pull_mbps gates the rclone->Drive boot path (80 = 10 MB/s), download_mbps the generic path; during the 2026-07-19 network event all US mid-band hosts measured 9-20 mbps on BOTH — the gate correctly blocks launches there until it clears (widen --max-dph to reach other DC families if launching is urgent).",
   "download_mbps": 200,
   "drive_pull_mbps": 80,
-  "disk_write_mbps": 100,
-  "cpu_jpeg_per_sec": 500,
-  "pcie_h2d_gbps": 2.0,
-  "gpu_bf16_tflops": 30
+  "disk_write_mbps": 200,
+  "cpu_jpeg_per_sec": 2000,
+  "pcie_h2d_gbps": 8.0,
+  "gpu_bf16_tflops": 150
 }
