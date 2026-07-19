@@ -191,6 +191,14 @@ def search_offers(gpu: str, max_dph: float, inet: int = 500, limit: int = 40):
     if not isinstance(offers, list):
         return []
     bl = load_blacklist()
+    # never rent a second slot on a machine already hosting one of our
+    # instances (2026-07-19: a racer landed on the same slow-network host
+    # the fleet was already suffering on)
+    try:
+        live = vast("show", "instances")
+        bl = bl | {i.get("machine_id") for i in (live or [])}
+    except Exception:
+        pass
     return [o for o in offers if o.get("machine_id") not in bl][:limit]
 
 
