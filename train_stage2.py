@@ -26,6 +26,7 @@ embedding + position only; verified by the invariance smoke test
 """
 
 import argparse
+import contextlib
 import math
 import os
 import time
@@ -153,9 +154,15 @@ class VocabNeocore(nn.Module):
         per_round[-1] += self.budget - sum(per_round)
         scores = None
         for r, k_r in enumerate(per_round):
-            x = tok0 + covered.unsqueeze(-1) * self.marker
-            h = self._run_core(x)
-            scores = self.score_head(h).squeeze(-1)          # (B, N_POS)
+            # only the FINAL round's scores reach the loss (via the gate);
+            # earlier rounds are pure selection — no_grad, or R autograd
+            # graphs OOM a 32 GB card at batch 1024
+            grad_ctx = (contextlib.nullcontext() if r == self.rounds - 1
+                        else torch.no_grad())
+            with grad_ctx:
+                x = tok0 + covered.unsqueeze(-1) * self.marker
+                h = self._run_core(x)
+                scores = self.score_head(h).squeeze(-1)      # (B, N_POS)
             with torch.no_grad():
                 if self.arm.startswith("T"):
                     one = torch.ones_like(codes, dtype=torch.float)
@@ -326,6 +333,11 @@ def freq_overlap(model, codes, device, n_batches=5, batch=512):
 def train_arm(args, codebook, train_codes, train_labels, val_codes,
               val_labels, budget, device, run):
     torch.manual_seed(args.seed)
+    if args.arm.endswith("learned") and args.batch_size > 512:
+        # learned arms carry two graphs (final round + prediction pass);
+        # batch 1024 OOMs 32 GB
+        args.batch_size = 512
+        print(f"[{args.arm}] batch_size capped to 512 (two-graph memory)")
     model = VocabNeocore(codebook.shape[0], args.arm, budget,
                          rounds=args.rounds, codebook=codebook).to(device)
     n_params = sum(p.numel() for p in model.parameters())
