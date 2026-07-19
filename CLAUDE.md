@@ -348,6 +348,49 @@ TokenCut reference parses. Open beyond: recurrence-triggered promotion
 (mint new vocab entries for recurring arrangements — online BPE over
 parses), episode-structured data (video) as the pressure for caching.
 
+## Research checkpoint (2026-07-19) — stage 2 six-arm verdict: random wins, selection machinery loses
+
+train_stage2.py, 6 arms x 3 budgets, ~$5 total, figure
+runs/s2_sixarm_analysis.png. Task: admit under budget (positions or
+codes), then classify code ids at hidden positions (K=2048 CE; NO
+mixing channel — memory is only chosen code embeddings, leak-proof).
+Best top1 @ coverage (val, own-residue denominator):
+
+- P-random  39.4/44.8/49.7 @ .10/.19/.38  <- best everywhere
+- P-uniform 36.7/38.3/47.4 @ same
+- P-learned 30.0/31.5/40.7 @ same         <- WORST position arm
+- T-random  21.9/31.6/38.9 @ .25/.47/.79
+- T-learned 20.4/20.0/20.9 @ .46/.43/.23 (coverage FELL with budget)
+- T-freq    18.3/19.0/18.3 @ .66/.82/.94 (flat — counting is dead)
+
+Findings:
+1. **P arms share identical coverage per budget -> clean comparison:
+   learned admission LOSES to random AND to a fixed grid at every
+   budget.** No denominator excuse. The gate-whisper gradient (only
+   final-round scores, via a (1+sigmoid) gate) does not teach selection.
+2. **Mask-diversity curriculum confound identified**: the random policy
+   re-samples masks every batch (MAE-style augmentation) -> trains a
+   better predictor; uniform/learned give near-fixed masks. Explains
+   random>uniform (~2-6 pt); the further uniform>learned gap (~7 pt) is
+   learned being actively bad. Own-residue denominators additionally
+   flatter low-coverage arms (T-freq's exam = the hard residue).
+3. **Positions >> types at matched coverage** (T-learned B32 CE 3.78 @
+   .23 vs P-random B49 CE 2.03 @ .19): admitting a code covers ALL its
+   instances — massively redundant coverage (70 sky patches ~= 5).
+   Type admission as "cover full support" wastes budget; a type+exemplar
+   variant would fix this.
+4. Echoes MAE-literature "random masking beats structured" — harness
+   validated against a known result, in symbol space.
+5. **User's pre-registered skepticism vindicated**: on masked-symbol
+   compression, learned selection does not help. Not yet proven dead:
+   the two confounds + broken credit assignment leave one clean rescue
+   protocol — FROZEN-PREDICTOR: train one predictor on random masks,
+   freeze it, then train/evaluate selection policies against it (kills
+   the curriculum confound, enables a greedy-oracle upper-baseline and
+   counterfactual value targets for the scorer). That is the next
+   experiment if selection gets another shot; else pivot the objective
+   (probe-based / distill) per the standing modularity of the harness.
+
 ## Local environment (Windows)
 
 - No `python` on PATH. The project env is the `ToastEnv` conda env:
