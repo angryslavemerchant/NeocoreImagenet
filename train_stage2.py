@@ -163,7 +163,7 @@ class VocabNeocore(nn.Module):
                         .scatter_add_(1, codes, one)
                     present = counts > 0
                     cs = torch.zeros(B, self.k_codes, device=dev) \
-                        .scatter_add_(1, codes, scores.detach())
+                        .scatter_add_(1, codes, scores.detach().float())
                     cs = cs.masked_fill(~present | admitted_codes,
                                         float("-inf"))
                     k_eff = min(k_r, int((~admitted_codes & present)
