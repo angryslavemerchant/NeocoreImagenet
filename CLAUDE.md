@@ -438,6 +438,69 @@ Findings:
    experiment if selection gets another shot; else pivot the objective
    (probe-based / distill) per the standing modularity of the harness.
 
+## Research checkpoint (2026-07-19, evening) — QK-admission: the selection question is CLOSED on static classification
+
+train_vocab_qk.py (commit af6bd48), run on one 5090 (~$0.75 total,
+sweep artifact qk-sweep in neocore-cls; per-config wandb runs — the
+WANDB_RUN_ID merge bug is fixed by popping the env var). The user-
+designed globality-law-compliant architecture: NO mixing before
+admission — keys are pure per-token functions of (code, pos), constant
+across rounds; 8 learned query heads (score = max over heads) admit
+exact-B into a 6-block core that mixes only the admitted; round output
+rejoins the pool as memory AND modulates the queries via cross-attn
+(foveation: the query is the fovea, modulation is the saccade). Smoke
+verified locality to the gradient level: never-admitted positions get
+exactly-zero pos.grad.
+
+**Pre-flight discovery (the day's real find): the gate-whisper failure
+isolated in pure form, then FIXED.** Hard detached top-k with gradient-
+only-through-admitted has no exploration: a never-admitted token gets
+no gate gradient, its embedding goes stale, and it drifts OUT of the
+query subspace permanently (needle toy: score gap trended to -0.02,
+admission pinned 0.000, chance acc). Fix: epsilon-greedy admission —
+budget/8 slots uniform-random during training, pure top-k at eval.
+Needle toy after: gap +1.77, admission 0.875, acc 1.00; full smoke
+learned 0.76 vs random 0.19 — **the mechanism demonstrably CAN learn
+selection when selection is the task.** (This retroactively explains
+part of the stage-2 P-learned loss.)
+
+**Sweep verdict (40 ep each, K=2048 codes): learned < static < random
+at BOTH budgets, and accuracy tracks coverage monotonically across all
+six loop arms:**
+
+- QK_dense6 (all 256):   90.32   (matches prior dense 90.52)
+- B16: learned 72.66 (cov .09-.12, DEGRADED late 72.7->61 as shift
+  fell .89->.63) < static 75.74 (cov .06 exact) < random 85.68 (cov .22)
+- B64: learned 80.22 (cov .33-.39, shift 1.00) < static 83.56 (cov .25)
+  < random 89.82 (cov .62 — within 0.5 pt of dense)
+
+Readings: (1) coverage is destiny — six arms, one curve; random
+diversity is free coverage and nothing selection can learn beats it
+here. (2) The query shift churns instead of complementing: learned
+converges to re-picking its static ranking (shift ~1.0), retention ~0,
+and at B16 its late deviations actively HURT. (3) Train/eval mismatch
+noted: learned trains with epsilon slots but evals pure-greedy.
+(4) With every prior excuse removed — admission pre-mixing, credit
+assignment fixed, exploration added, static + random controls — random
+still wins. **Conclusion: the machinery can learn selection; static
+IN-100 classification does not reward it. There is no needle. Selection
+work on this task family is closed; the open venues are the ones in the
+globality-law requirements: perception with real cost, episode
+structure (video) so knowing-where-to-look accrues value, promotion
+loop.** Do not re-run selection-vs-random on static classification.
+
+Ops: 2026-07-19 network event localized — it is the California-EPYC DC
+families (+ m9105 Romania) at 9-20 mbps to BOTH HF and Drive; a
+Maryland Ryzen host (m140334) measured 407/213 mbps and passed every
+gate with margin. The hedge race correctly killed 3 poisoned-pool
+racers (~$0.15); single-launch on a judged out-of-pool offer worked
+first try. Boot-to-training in ~6 min (bank pull + blob + full DINO
+lake extraction at ~3100 img/s). Two watcher lessons: vastai logs (a
+Windows Python CLI) CRASHES on unicode progress bars in remote logs
+unless PYTHONUTF8=1 is exported — the crash looks exactly like "no
+logs" (two false instance-gone alarms); and $TMPDIR is unset in
+Monitor shells — state files must use an explicit absolute path.
+
 ## Local environment (Windows)
 
 - No `python` on PATH. The project env is the `ToastEnv` conda env:
