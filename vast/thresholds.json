@@ -1,6 +1,7 @@
 {
-  "_comment": "TEMPORARY sanity floors only - deliberately loose until the pipeline completes one full run end-to-end (user request 2026-07-14). Recalibrate with launch.py scan on the Blackwell fleet afterwards.",
-  "_download_mbps": "info-only until the bench download test is proven on DC networks",
+  "_comment": "Floors updated 2026-07-19 (5090 fleet, bank-era boot path). download_mbps promoted from info-only; drive_pull_mbps gates the rclone->Drive path the boot actually depends on (80 mbps = 10 MB/s; the 2026-07-19 slow host measured ~27). gpu/disk/cpu/pcie remain broken-hardware floors, not performance bars.",
+  "download_mbps": 200,
+  "drive_pull_mbps": 80,
   "disk_write_mbps": 100,
   "cpu_jpeg_per_sec": 500,
   "pcie_h2d_gbps": 2.0,

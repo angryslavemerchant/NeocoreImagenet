@@ -97,6 +97,32 @@ def bench_download(size_mb: int = 200) -> dict:
     raise last_err
 
 
+def bench_bank(size_mb: int = 64) -> dict:
+    """Throughput on the ACTUAL boot dependency: a ranged read of the
+    dataset tar from the Drive bank via rclone. Generic download speed
+    does not predict this path (Drive peering/throttling varies per
+    host — a 3 MB/s host cost a boot 10 extra minutes on 2026-07-19).
+    Requires the bank token (launch.py always forwards it); a missing
+    token surfaces as a gate failure, which is the correct loud response
+    to a misconfigured boot."""
+    import subprocess
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    import bank
+    if not bank._token():
+        raise RuntimeError("RCLONE_DRIVE_TOKEN not configured")
+    bank._rclone_ready()
+    t0 = time.perf_counter()
+    proc = subprocess.run(
+        ["rclone", "cat", "--count", str(size_mb * (1 << 20)),
+         f"{bank.BANK_REMOTE}/{bank.BANK_TAR}"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=100)
+    dt = time.perf_counter() - t0
+    if proc.returncode != 0:
+        raise RuntimeError(f"rclone cat failed: {proc.stderr[-200:]!r}")
+    return {"drive_pull_mbps": round(size_mb * 8 / dt, 1)}
+
+
 def bench_disk(path: str = "/workspace/.bench_tmp", size_mb: int = 1024) -> dict:
     """Sequential write throughput with fsync (matters for JPEG cache build)."""
     buf = os.urandom(1 << 20)
@@ -208,6 +234,7 @@ def bench_gpu(n: int = 8192, reps: int = 30) -> dict:
 # CUDA context creation, which alone can take ~30s on a cold instance.
 TESTS = {
     "download": (bench_download, 240),
+    "bank": (bench_bank, 150),
     "disk": (bench_disk, 180),
     "cpu": (bench_cpu, 120),
     "pcie": (bench_pcie, 180),
