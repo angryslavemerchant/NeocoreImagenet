@@ -501,6 +501,77 @@ unless PYTHONUTF8=1 is exported — the crash looks exactly like "no
 logs" (two false instance-gone alarms); and $TMPDIR is unset in
 Monitor shells — state files must use an explicit absolute path.
 
+## Research checkpoint (2026-07-19 night) — episodic binding: the task that finally differentiates, and the read-circuit discovery
+
+train_vocab_icl.py (commits 88a1223+d130806), one HK 5090, ~$2 incl.
+boot lottery. Task: 6-image episodes over the code lake, every image
+carries a label token from a per-episode random permutation (the answer
+is a binding that exists ONLY in the episode — unsmearable by
+construction); probe query after every step; final-probe top1 over 20
+held-out classes is the metric; chance 16.7%.
+
+Architecture (each choice forced by a smoke-caught failure of the
+obvious alternative — see the file docstring): QK admission = per-step
+perception bandwidth (label always admitted + B-1 chosen content
+tokens) over an ACCUMULATING memory; ONE fused binding token written
+per image; architectural cosine read head (learnable temperature) with
+auxiliary retrieval supervision (CE on read attention — the correct
+slot is known at train time). Toy dissociation that justified launch:
+oracle admission 1.00 / learned 0.34 / random 0.32 — pipeline perfect
+given good content, admission learning the sole bottleneck.
+
+SWEEP_RESULTS (best top1; read_hit tracks top1/100 closely):
+- B4:  random 65.43 > oracle-MI 60.40 > learned 58.45 > static 52.15
+- B16: random 69.97 > learned 67.29 > static 64.99 > oracle-MI 62.99
+- dense (full attention over concatenated episode): **17.58 = CHANCE**
+
+Findings:
+1. **The dense result is the discovery: free-form attention CANNOT
+   learn the episodic binding at this scale** (2M episodes, d=256, 6
+   blocks — flat at chance, exactly as in the CPU toy). The two-hop
+   binding circuit does not form. The architectural memory (fused
+   write + content-addressed read + aux supervision) is not scaffolding
+   — it is the entire difference between 17.6 and 70. Echoes the
+   induction-head phase-transition literature; at this scale the phase
+   never arrives.
+2. **First task in project history where policies separate**: 52-70
+   spread across arms at fixed architecture (static classification
+   bunched everything within noise). The episodic binding pressure is
+   real.
+3. **Learned admission genuinely learned informativeness**: ≈oracle-MI
+   at B4 (58.4 vs 60.4), ABOVE oracle at B16 (67.3 vs 63.0). Not
+   degenerate, not random-hugging — the first demonstrated learned-
+   selection success at scale (with aux supervision + epsilon-greedy
+   doing the credit assignment the bare gate never could).
+4. **Random still wins (+2.7 at B16, +7.0 at B4): pick DIVERSITY beats
+   pick QUALITY on this vocabulary.** Now measured against an oracle:
+   informed-but-near-static selection (oracle-MI, fixed table; learned,
+   converged policy) loses ~5 pts to fresh-every-episode random picks —
+   the mask-diversity/augmentation force, quantified. MAE's law again,
+   one level up: what gets STORED benefits from variety more than from
+   optimality. Modulation is worth real points (learned - static: +6.3
+   B4, +2.3 B16).
+5. Read instruments: hit ≈ top1 throughout (retrieval IS the task);
+   dense-arm probe accs 1/n-of-seen during the failures — the
+   guess-among-seen plateau is the universal pre-binding solution.
+Open next (not started): diversity-aware learned policy (sample from
+score distribution instead of top-k — quality AND variety); dense+aux
+control (is supervision alone enough to teach free attention?); longer
+episodes / more distractors where quality should bind harder; N_way
+scaling.
+
+Ops (2026-07-19 night): boot lottery was brutal — California pool still
+event-degraded (gate-blocked), m43567 Washington blacklisted (DNS-dead
+container: status_msg shows `curl: (6)` while logs stay empty — check
+status_msg when logs are silent), Vietnam m34181 vanished pre-gate,
+one hedge race all-failed. HK m144349 passed after a REASONED gate
+relaxation: download_mbps 200->120 (bank boots move ~2.4 GiB via Drive
++ ~100 MB generic; 120 still blocks the 9-20 mbps event signature 6x
+over; the old floor was 25 GB-HF-era calibration and rejected a healthy
+161-mbps host). Watcher lessons: export PYTHONUTF8=1 in monitor shells
+(vastai logs crashes on unicode progress bars = fake "no logs") and use
+$TEMP not $TMPDIR (unset in monitor shells).
+
 ## Local environment (Windows)
 
 - No `python` on PATH. The project env is the `ToastEnv` conda env:
