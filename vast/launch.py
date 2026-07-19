@@ -466,8 +466,8 @@ def cmd_scan(args):
 
     # Prefer distinct physical machines for a meaningful sample, sampled
     # around the median price (cheapest offers over-sample lemons).
-    offers.sort(key=lambda o: abs(
-        o["dph_total"] - statistics.median(x["dph_total"] for x in offers)))
+    median_dph = statistics.median(o["dph_total"] for o in offers)
+    offers.sort(key=lambda o: abs(o["dph_total"] - median_dph))
     picked, seen_machines = [], set()
     for o in offers:
         m = o.get("machine_id")
