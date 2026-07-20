@@ -1,5 +1,12 @@
 # NeocoreImagenet
 
+> **⚠ REPO FROZEN (2026-07-20): active work moved to
+> `angryslavemerchant/NeocoreEpisodic`** (clean-slate continuation —
+> episodic foveated learner era). This repo is the archive of the
+> 2026-07 research program; its checkpoints below remain the
+> authoritative history. Open new sessions in
+> `C:\Users\JmgLi\documents\Python Projects\NeocoreEpisodic`.
+
 Neocore (formerly ASFNet — old naming retired) experiments on ImageNet-100
 (`clane9/imagenet-100`, auto-downloaded from HuggingFace on first run; DALI
 dataloading via a one-time JPEG cache, or the RAM-resident blob cache).
